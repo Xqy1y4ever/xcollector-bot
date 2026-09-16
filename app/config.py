@@ -64,7 +64,9 @@ class Settings(BaseSettings):
 
     # ---------------- 后端 ----------------
     backend_base_url: str = "http://127.0.0.1:8000"
-    backend_api_token: str = ""
+    # 推消息给后端时带的令牌。名字刻意和后端那边的 INGEST_API_TOKEN 保持一致 ——
+    # 同一个密钥在整套系统里只有一个名字，不需要猜「这两个名字其实是一回事」。
+    ingest_api_token: str = ""
     backend_timeout: float = 15.0
     # 「重试 3 次」= 首次失败后再试 3 次，退避 1s/2s/4s
     backend_max_retries: int = 3

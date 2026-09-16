@@ -65,8 +65,8 @@ class BackendClient:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         headers: dict[str, str] = {}
-        if self.settings.backend_api_token:
-            headers["Authorization"] = f"Bearer {self.settings.backend_api_token}"
+        if self.settings.ingest_api_token:
+            headers["Authorization"] = f"Bearer {self.settings.ingest_api_token}"
         self._client = httpx.AsyncClient(
             base_url=self.settings.backend_base,
             timeout=self.settings.backend_timeout,
