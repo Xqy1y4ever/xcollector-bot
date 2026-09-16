@@ -1,6 +1,12 @@
 # Xcollector bot —— 核心依赖（Python 3.12+）
-# 这个服务只做两件事：独占 OneBot 连接 + 处理私聊指令。
-# 刻意不引入数据库 / LLM / 其它 Web 框架：bot 不该有状态，有状态的部分都在 backend。
+#
+# 这个仓库现在是**消息处理层**：连 OneBot、筛选、抽取、digest、附件、统计全在这里，
+# 后端退化成纯 CRUD 数据层。
+#
+# ⚠️ 这里**刻意不含 litellm**：核心链路在 EXTRACTOR=rule 时不碰任何模型，
+#    所以不装 litellm 也能把「收到消息 → 入库 → 建通知 → digest」整条跑通。
+#    要跑 LLM 抽取请装：
+#        .\.venv\Scripts\python.exe -m pip install -r requirements-llm.txt
 
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
@@ -9,5 +15,5 @@ httpx>=0.27.0
 pydantic>=2.7.0
 pydantic-settings>=2.3.0
 python-dotenv>=1.0.0
-# Windows 没有系统 tzdata，ZoneInfo("Asia/Shanghai") 会失败
+# Windows 没有系统 tzdata，ZoneInfo("Asia/Shanghai") 会失败；抽取的时间解析全靠它
 tzdata>=2024.1

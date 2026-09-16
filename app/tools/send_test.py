@@ -1,14 +1,18 @@
-"""端到端自检：造一条假的 OneBot 群消息，走完整条归一化链路，再推给 backend。
+"""端到端自检：造一条假的 OneBot 群消息，走完整条归一化链路，再按契约写进后端。
 
-    python -m app.tools.send_test                 # 归一化 + 转发到 BACKEND_BASE_URL
+    python -m app.tools.send_test                 # 归一化 + 写 BACKEND_BASE_URL
     python -m app.tools.send_test --print-only    # 只看归一化结果，不发网络请求
     python -m app.tools.send_test --forward-fail  # 模拟合并转发展开失败（看降级文案）
-    python -m app.tools.send_test --count 5       # 连发 5 条（能看出攒批效果）
+    python -m app.tools.send_test --count 5       # 连发 5 条
     python -m app.tools.send_test --to-self       # 向 bot 自己的 /api/send/private 发一条假消息
     python -m app.tools.send_test --backend-url http://127.0.0.1:9000
 
 它不需要 NapCat：`FakeHub` 顶替 hub，把 get_forward_msg / get_group_info
 换成固定数据，于是合并转发递归展开、群名缓存这些逻辑都能被真实执行到。
+
+写后端那一步现在走的是**真流水线**（pipeline.runner.ingest_message）：
+写前日志 → 附件 → 抽取 → 建通知 → 统计。
+默认 `--extractor rule`，因为这台机器上不一定装得了 litellm。
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from ..backend_client import BackendClient
 from ..config import Settings, get_settings
 from ..logging_setup import setup_logging
 from ..normalize import MessageNormalizer
+from ..pipeline.runner import ingest_message
 
 # Windows 控制台默认 GBK，print 中文/emoji 会 UnicodeEncodeError
 for _stream in (sys.stdout, sys.stderr):
@@ -108,6 +113,8 @@ class FakeHub:
         self.fail_forward = fail_forward
         self.fail_group_info = fail_group_info
         self.calls: list[str] = []
+        # 让 FakeHub 也能撑起运行时里"连接状态"的读取（没有真实连接）
+        self.connected = False
 
     async def get_forward_msg(self, forward_id: str) -> list[dict]:
         self.calls.append(f"get_forward_msg({forward_id})")
@@ -148,41 +155,46 @@ async def run_ingest(args: argparse.Namespace) -> int:
         backend_base_url=args.backend_url,
         backend_timeout=args.timeout,
         backend_max_retries=args.retries,
+        extractor=args.extractor,
+        media_download_enabled=not args.no_media,
     )
     hub = FakeHub(fail_forward=args.forward_fail)
     normalizer = MessageNormalizer(settings)
 
-    payloads: list[dict] = []
+    messages: list = []
     for event in build_events(args.count):
         msg = await normalizer.normalize(event, hub)
         if msg is None:
             print("!! 归一化返回 None，事件被忽略了")
             return 1
-        payloads.append(msg.to_dict())
+        messages.append(msg)
 
     print("=== 归一化结果（第 1 条）===")
-    print(json.dumps(payloads[0], ensure_ascii=False, indent=2))
-    print(f"=== 共 {len(payloads)} 条，FakeHub 调用：{hub.calls} ===")
+    print(json.dumps(messages[0].to_dict(), ensure_ascii=False, indent=2))
+    print(f"=== 共 {len(messages)} 条，FakeHub 调用：{hub.calls} ===")
 
     if args.print_only:
         return 0
 
     client = BackendClient(settings)
     started = time.monotonic()
+    outcomes: list[str] = []
     try:
-        ok = await client.ingest_messages(payloads)
+        for msg in messages:
+            outcomes.append(await ingest_message(msg, client, settings=settings))
     finally:
         await client.close()
     elapsed = time.monotonic() - started
 
-    if ok:
-        print(f"[OK] 已推送给 {settings.backend_base}（{elapsed:.2f}s）")
-        return 0
-    print(
-        f"[FAIL] 推送给 {settings.backend_base} 失败（{elapsed:.2f}s）"
-        f"；上面应该有 WARNING/ERROR 日志，退避 1s/2s/4s"
-    )
-    return 2
+    print(f"=== 处理结果：{outcomes}（{elapsed:.2f}s）===")
+    if "error" in outcomes:
+        print(
+            f"[FAIL] 有消息没能写进 {settings.backend_base}；"
+            "上面应该有 WARNING/ERROR 日志（退避 1s/2s/4s）"
+        )
+        return 2
+    print(f"[OK] 已按契约写入 {settings.backend_base}：{outcomes}")
+    return 0
 
 
 async def run_to_self(args: argparse.Namespace) -> int:
@@ -232,6 +244,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--forward-fail", action="store_true", help="模拟合并转发展开失败，验证降级文案"
     )
+    parser.add_argument(
+        "--extractor", default="rule", help="rule/llm/both（默认 rule：不需要 litellm）"
+    )
+    parser.add_argument("--no-media", action="store_true", help="不下载附件")
     parser.add_argument("--to-self", action="store_true", help="改为向 bot 的 /api/send/private 发消息")
     parser.add_argument("--bot-url", default=None, help="bot 的地址（默认读配置）")
     parser.add_argument("--bot-token", default=None, help="bot 的 BOT_API_TOKEN")

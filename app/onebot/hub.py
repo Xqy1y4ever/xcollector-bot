@@ -39,8 +39,28 @@ class OneBotNotConnected(RuntimeError):
     """没有任何 OneBot 连接时调用 API 会抛这个。
 
     HTTP 层捕获它并返回 {"ok": false, "error": ...}，
-    这样 backend 能区分「调 bot 失败」和「bot 调 NapCat 发送失败」。
+    这样调用方能区分「调 bot 失败」和「bot 调 NapCat 发送失败」。
     """
+
+
+def interpret_send_result(resp: object) -> str | None:
+    """检查 OneBot 的 API 响应，失败时返回错误描述。
+
+    hub.call_api 拿到响应就算"调用成功"，但 NapCat 可能返回
+    status=failed / retcode!=0（比如"该群不存在"、"机器人被禁言"）。
+    这两种失败必须区分：前者是 bot 的问题，后者是 QQ 那边的问题。
+
+    放在 hub 里而不是各自实现一份：`/api/send/*` 和 digest 都要用它，
+    两处对"什么叫发送失败"的判断必须完全一致。
+    """
+    if not isinstance(resp, dict):
+        return None
+    status = resp.get("status")
+    retcode = resp.get("retcode")
+    if status in (None, "ok") and retcode in (None, 0):
+        return None
+    detail = resp.get("message") or resp.get("wording") or f"retcode={retcode}"
+    return str(detail)
 
 
 class _Conn:

@@ -5,8 +5,15 @@
     python -m app.main
 
 这个进程同时干两件事，但它们是**两个不同的端口**，别搞混：
-  - BOT_LISTEN_PORT（默认 8082）：本服务的 HTTP API，给 backend 调；
+  - BOT_LISTEN_PORT（默认 8082）：本服务的 HTTP API，给前端 / 后端调；
   - ONEBOT_LISTEN_PORT（默认 8081，仅 server 模式）：给 NapCat 的反向 WS 用。
+
+消息处理现在是**两段式**（见 MessagePipeline）：
+  1. 收到事件 → 归一化 → 群白名单 → **写前日志** POST /api/messages；
+  2. 拿到 id 之后的重活（附件、抽取、建通知、统计）交给一个后台 worker。
+
+第一段必须快且先做，因为 QQ 群消息是唯一不可再生的资产；第二段慢且可以重来，
+因为原文已经在后端里了（`state=pending` 就是它的恢复队列）。
 """
 
 from __future__ import annotations
@@ -14,132 +21,192 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager, nullcontext, suppress
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, WebSocket
 from pydantic import BaseModel, field_validator
 
 from . import __version__
-from .backend_client import BackendClient
-from .commands import CommandRouter, log_forward
+from .backend_client import BackendClient, BackendError
+from .commands import CommandRouter
 from .config import Settings, get_settings
 from .logging_setup import setup_logging
 from .normalize import MessageNormalizer, NormalizedMessage, message_kind
 from .onebot import OneBotHub, OneBotNotConnected
-from .utils import truncate
+from .onebot.hub import interpret_send_result
+from .pipeline.digest import build_digest, configure_digest, digest_loop, send_digest
+from .pipeline.runner import (
+    close_media_client,
+    finish_message,
+    ingest_message,
+    resume_pending,
+    write_ahead,
+)
+from .pipeline.watchdog import silence_loop, startup_gap_check
+from .utils import local_day, now_ms, truncate
 
 setup_logging()
 logger = logging.getLogger("xcollector.bot")
 _settings = get_settings()
 
 # /api/send/* 的长度上限。超长消息 NapCat 会直接报错，
-# 与其让 backend 去猜为什么发不出去，不如截断后如实告知（后缀就是告知）。
+# 与其让调用方去猜为什么发不出去，不如截断后如实告知（后缀就是告知）。
 MESSAGE_MAX_CHARS = 1500
 TRUNCATE_SUFFIX = "…（已截断）"
 
-# 攒批参数。200ms 是刻意选的：
-# 群通知经常是"连发 3~5 条"，200ms 能把它们合成一个请求；
-# 同时 200ms 短到用户感觉不出延迟，单条消息也不会为了攒批拖几秒。
-BATCH_WINDOW_SECONDS = 0.2
-BATCH_MAX_SIZE = 20
-# 队列上限：backend 长时间挂掉时不能让消息把内存撑爆
+# 第二段的重活队列上限。队列满时丢**最新**的那条并记 ERROR ——
+# 它不会丢数据（原文已经在后端里，状态停留在 pending），
+# 下一次 resume_pending() 会把它捡回来。
 QUEUE_MAX_SIZE = 2000
 
+# 崩溃恢复：每轮最多补多少条、多久扫一次
+RECOVERY_SWEEP_SECONDS = 60.0
+
+# 盲区计数的时间窗口（和后端原来的 `_blindspots()` 保持一致）
+UNPARSED_WINDOW_DAYS = 7
+
 
 # ---------------------------------------------------------------------------
-# 转发：攒批 + 重试（重试逻辑在 BackendClient 里）
+# 两段式消息流水线
 # ---------------------------------------------------------------------------
 
 
-class MessageForwarder:
-    """把归一化后的消息攒成小批送给 backend。
+@dataclass
+class QueuedMessage:
+    """已经落库、等着做重活的一条消息。"""
 
-    为什么要有队列而不是直接 await：
-      OneBot 的接收循环必须永远是"收下一条"的状态。任何在这里的 await
-      都可能把接收卡住，而 backend 挂了是常态（重启、升级、抽风）。
-      队列把两边的时间尺度解耦开：接收永远不等待，发送慢就慢在后台。
+    raw_id: str
+    doc: dict
+    is_new: bool
+
+
+class MessagePipeline:
+    """接收 → 写前日志 → 队列 → 附件/抽取/建条。
+
+    **为什么不再攒批**：改造前用 200ms 窗口把连续几条消息合成一个请求发走。
+    现在每条消息都要下载附件、调 LLM、写好几次后端 —— 根本没法批处理，
+    那个缓冲只会变成一个"进程被 kill 时缓冲区里的原始消息直接消失"的窗口。
+    所以缓冲被删掉了：收到就立刻落库。
+
+    **为什么要队列**：写前日志之后还有很长的重活（LLM 可能跑 60 秒）。
+    队列把"接收"和"处理"解耦，且 worker 只有**一个**：
+    群状态 upsert 必须按消息时间顺序执行，否则 last_msg_ts 会来回跳，
+    缺口检测（runner._maybe_gap_alert）就会开始报假警。
     """
 
     def __init__(self, backend: BackendClient, settings: Settings | None = None):
         self.settings = settings or get_settings()
         self.backend = backend
-        self._queue: asyncio.Queue[NormalizedMessage] = asyncio.Queue(QUEUE_MAX_SIZE)
-        self._task: asyncio.Task | None = None
-        self._dropped = 0
+        self._queue: asyncio.Queue[QueuedMessage] = asyncio.Queue(QUEUE_MAX_SIZE)
+        self._worker: asyncio.Task | None = None
+        self._retry_task: asyncio.Task | None = None
+        self.dropped = 0
+        self.processed = 0
 
     async def start(self) -> None:
-        self._task = asyncio.create_task(self._flush_loop())
+        self._worker = asyncio.create_task(self._work_loop())
+        self._retry_task = asyncio.create_task(self._retry_loop())
+
+    @property
+    def depth(self) -> int:
+        """第二段队列里还压着多少条（给 /api/status 用）。"""
+        return self._queue.qsize()
 
     async def stop(self) -> None:
-        if self._task:
-            self._task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
-        await self._final_flush()
+        for task in (self._worker, self._retry_task):
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+        self._worker = None
+        self._retry_task = None
+        await close_media_client()
 
-    async def submit(self, msg: NormalizedMessage) -> None:
-        """收下一条消息。永不阻塞、永不抛异常。"""
+    async def submit(self, msg: NormalizedMessage) -> str:
+        """第一段：群白名单 + 写前日志。返回结果字符串（也是一行日志里的 `结果=`）。"""
+        wa = await write_ahead(msg, self.backend, self.settings)
+        if wa.outcome != "ok":
+            return wa.outcome
+        assert wa.raw_id
         try:
-            self._queue.put_nowait(msg)
-            return
+            self._queue.put_nowait(QueuedMessage(wa.raw_id, wa.doc, wa.is_new))
         except asyncio.QueueFull:
-            pass
-
-        # 队列满 = backend 已经挂了很久。丢最旧的而不是拒收最新的：
-        # 旧通知大概率已经被后来的消息覆盖，新消息更接近用户现在关心的事。
-        with suppress(asyncio.QueueEmpty):
-            self._queue.get_nowait()
-        self._dropped += 1
-        if self._dropped == 1 or self._dropped % 100 == 0:
-            logger.error("转发队列已满，丢弃最旧的消息（累计已丢 %d 条）", self._dropped)
-        with suppress(asyncio.QueueFull):
-            self._queue.put_nowait(msg)
+            # 不丢数据：原文已经在后端里、状态停在 pending，
+            # 下一轮 resume_pending() 会把它捡回来继续做。
+            self.dropped += 1
+            logger.error(
+                "重活队列已满，暂缓处理 raw=%s（原文已落库，等待崩溃恢复补处理；累计 %d 条）",
+                wa.raw_id,
+                self.dropped,
+            )
+            return "deferred"
+        return "queued"
 
     # ---------------- 内部 ----------------
 
-    async def _flush_loop(self) -> None:
-        loop = asyncio.get_running_loop()
+    async def _work_loop(self) -> None:
         while True:
-            first = await self._queue.get()
-            batch = [first]
-            deadline = loop.time() + BATCH_WINDOW_SECONDS
-            while len(batch) < BATCH_MAX_SIZE:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
+            item = await self._queue.get()
+            try:
+                await finish_message(
+                    item.raw_id,
+                    item.doc,
+                    self.backend,
+                    settings=self.settings,
+                    is_new=item.is_new,
+                )
+                self.processed += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # 单条失败不能拖垮 worker
+                logger.exception("处理消息失败 raw=%s: %s", item.raw_id, exc)
+
+    async def _retry_loop(self) -> None:
+        """补写"连原文都没写进后端"的那些消息。
+
+        这一类是唯一真正可能丢的东西（后端 4xx / 一直不可达），所以：
+          - 立刻打一行带 `待重试=是` 的 ERROR（绝不静默）；
+          - 队列计数暴露在 /api/status 的 `pipeline.pending_retry` 上；
+          - 每 PENDING_RETRY_INTERVAL 秒重放一次，超过次数后记 ERROR 放弃。
+        已经落库、只是没处理完的消息**不走这里**，走 resume_pending()。
+        """
+        interval = max(5.0, float(self.settings.pending_retry_interval))
+        max_attempts = max(1, int(self.settings.pending_retry_max_attempts))
+        while True:
+            await asyncio.sleep(interval)
+            for item in self.backend.pending.items():
+                self.backend.pending.remove(item)
+                item.attempts += 1
+                if item.attempts > max_attempts:
+                    logger.error(
+                        "待重试写入已放弃（试了 %d 次）：群=%s msg_id=%s | 原因=%s",
+                        item.attempts - 1,
+                        item.message.get("group_id"),
+                        item.message.get("message_id"),
+                        item.note,
+                    )
+                    continue
                 try:
-                    batch.append(await asyncio.wait_for(self._queue.get(), remaining))
-                except asyncio.TimeoutError:
-                    break
-            await self._send(batch)
-
-    async def _send(self, batch: list[NormalizedMessage]) -> bool:
-        ok = await self.backend.ingest_messages([m.to_dict() for m in batch])
-        for msg in batch:
-            log_forward(
-                ok=ok,
-                group_id=msg.group_id,
-                group_name=msg.group_name,
-                sender_name=msg.sender_name,
-                message_id=msg.message_id,
-                text=msg.text,
-            )
-        return ok
-
-    async def _final_flush(self) -> None:
-        """关停前尽力把队列里剩下的发出去（best effort，超时就放弃）。"""
-        batch: list[NormalizedMessage] = []
-        while not self._queue.empty() and len(batch) < BATCH_MAX_SIZE * 5:
-            with suppress(asyncio.QueueEmpty):
-                batch.append(self._queue.get_nowait())
-        if not batch:
-            return
-        logger.info("关停前转发剩余的 %d 条消息", len(batch))
-        try:
-            await asyncio.wait_for(self._send(batch), timeout=3.0)
-        except Exception as exc:
-            logger.warning("关停前转发失败（已放弃）：%s", exc)
+                    outcome = await ingest_message(
+                        item.message, self.backend, settings=self.settings, retry=True
+                    )
+                except Exception as exc:
+                    logger.exception("补写异常：%s", exc)
+                    outcome = "error"
+                if outcome != "error":
+                    logger.info(
+                        "补写成功（第 %d 次）：msg_id=%s → %s",
+                        item.attempts,
+                        item.message.get("message_id"),
+                        outcome,
+                    )
+                    continue
+                # 又失败了：runner 已经重新入队，把尝试次数接上，避免无限重试
+                for fresh in self.backend.pending.items():
+                    if fresh.message.get("message_id") == item.message.get("message_id"):
+                        fresh.attempts = item.attempts
+                        break
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +219,7 @@ def build_onebot_ws_app() -> FastAPI:
 
     为什么要单独起一个 server 而不是挂在主应用上：
     `ONEBOT_LISTEN_PORT`(8081) 和 `BOT_LISTEN_PORT`(8082) 是**两个不同的端口**，
-    一个给 NapCat 连、一个给 backend 调。uvicorn 一个实例只监听一个端口，
+    一个给 NapCat 连、一个给外部调。uvicorn 一个实例只监听一个端口，
     所以 server 模式下额外起一个只服务 WS 的实例。
     两个 server 跑在**同一个事件循环**里 —— 这一点是必须的：
     hub 的连接对象是 asyncio 原语，跨线程/跨循环用会直接坏掉。
@@ -229,7 +296,7 @@ class ReverseWsServer:
 
 
 class BotRuntime:
-    """把 hub / backend / 归一化 / 指令串起来。
+    """把 hub / backend / 归一化 / 流水线 / 指令串起来。
 
     放在一个类里而不是散在 lifespan 的闭包里，是为了让
     "谁依赖谁"一眼可见，也方便把假 hub / 假 backend 塞进来做自检。
@@ -244,8 +311,10 @@ class BotRuntime:
         self.backend = BackendClient(self.settings)
         self.normalizer = MessageNormalizer(self.settings)
         self.router = CommandRouter(self.backend, self.hub, self.settings)
-        self.forwarder = MessageForwarder(self.backend, self.settings)
+        self.pipeline = MessagePipeline(self.backend, self.settings)
         self.ws_server = ReverseWsServer(self.settings)
+        self._tasks: list[asyncio.Task] = []
+        self.last_recovery: dict = {"at": None, "count": 0, "error": None}
 
     async def start(self) -> None:
         settings = self.settings
@@ -261,17 +330,27 @@ class BotRuntime:
             ", ".join(f"{v}({k})" for k, v in settings.command_whitelist_map.items())
             or "（为空：任何人都不能发指令）",
         )
+        logger.info(
+            "群白名单：%s",
+            ", ".join(f"{v}({k})" for k, v in settings.group_whitelist_map.items())
+            or "（为空：所有群都收）",
+        )
+        logger.info(
+            "发送者白名单：mode=%s %s",
+            settings.sender_whitelist_mode,
+            ", ".join(f"{v}({k})" for k, v in settings.sender_whitelist_map.items()) or "（为空）",
+        )
+        logger.info("抽取器=%s（主模型=%s）", settings.extractor, settings.llm_primary_model)
         logger.info("后端地址：%s", settings.backend_base)
 
-        if not settings.bot_api_token:
+        if not settings.inbound_token:
             # 这条 WARNING 是刻意留的：/api/send/* 能冒充机器人发言，
             # 忘了配 token 就等于把它暴露给任何能访问这个端口的人。
-            logger.warning(
-                "BOT_API_TOKEN 为空：/api/* 不校验认证，仅限本地开发使用"
-            )
+            logger.warning("BOT_API_TOKEN / API_TOKEN 均为空：/api/* 不校验认证，仅限本地开发使用")
         if not settings.command_whitelist_map:
             logger.warning("COMMAND_WHITELIST 为空：当前没有任何 QQ 号能发指令")
 
+        configure_digest(self.backend, self.hub)
         self.hub.set_event_handler(self.handle_event)
         await self.hub.start()
         if settings.onebot_mode == "server":
@@ -283,15 +362,28 @@ class BotRuntime:
                 settings.onebot_listen_port,
                 settings.onebot_listen_path,
             )
-        await self.forwarder.start()
+        await self.pipeline.start()
+        self._tasks = [
+            asyncio.create_task(digest_loop()),
+            asyncio.create_task(silence_loop(self.backend, self.settings)),
+            asyncio.create_task(self._recovery_loop()),
+        ]
 
     async def stop(self) -> None:
-        await self.forwarder.stop()
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        self._tasks = []
+        await self.pipeline.stop()
         if self.settings.onebot_mode == "server":
             await self.ws_server.stop()
         await self.hub.stop()
         await self.backend.close()
         logger.info("已关闭")
+
+    # ---------------- 事件 ----------------
 
     async def handle_event(self, event: dict) -> None:
         """OneBot 事件总入口。"""
@@ -300,18 +392,242 @@ class BotRuntime:
             msg = await self.normalizer.normalize(event, self.hub)
             if msg is None:
                 return
-            await self.forwarder.submit(msg)
+            await self.pipeline.submit(msg)
         elif kind == "private":
             await self.router.handle_private_event(event)
         else:
             # discuss（讨论组）等暂不支持。只记 DEBUG，避免刷日志。
             logger.debug("忽略事件类型 message_type=%s", event.get("message_type"))
 
-    def status_payload(self) -> dict:
-        payload = self.hub.status()
-        # groups 是"消息层"的知识（谁发过言），由归一化层维护
-        payload["groups"] = self.normalizer.groups.snapshot()
-        return payload
+    # ---------------- 崩溃恢复 ----------------
+
+    async def run_recovery(self) -> int:
+        """把后端里停在 pending 的消息捡回来继续处理。"""
+        count = await resume_pending(self.backend, self.settings)
+        self.last_recovery = {"at": now_ms(), "count": count, "error": None}
+        return count
+
+    async def _recovery_loop(self) -> None:
+        """启动时立刻补一次，OneBot 重连时补一次，之后每 RECOVERY_SWEEP_SECONDS 扫一次。
+
+        经常扫的理由：写前日志之后的重活失败时，消息会停在 `state=pending`；
+        不主动扫的话它要等到下次重启才被处理 —— 那就不是"绝不静默丢弃"了。
+        """
+        last_connected = False
+        last_sweep: float | None = None
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                connected = bool(self.hub.connected)
+                reconnected = connected and not last_connected
+                now = loop.time()
+                # 首次（last_sweep is None）必须立刻扫一次：上次崩溃留下的 pending
+                # 不能等到 60 秒后才开始补
+                if reconnected or last_sweep is None or (now - last_sweep) >= RECOVERY_SWEEP_SECONDS:
+                    count = await self.run_recovery()
+                    if count:
+                        logger.info("崩溃恢复：本轮补处理了 %d 条消息", count)
+                    last_sweep = now
+                last_connected = connected
+                if reconnected:
+                    # 重连后顺手看一眼有没有群静默了（断线期间的缺口）
+                    await startup_gap_check(self.backend, self.settings)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("崩溃恢复循环异常：%s", exc)
+                self.last_recovery = {"at": now_ms(), "count": 0, "error": str(exc)}
+            await asyncio.sleep(max(1.0, float(self.settings.recovery_check_interval)))
+
+    # ---------------- 状态 ----------------
+
+    async def _safe(self, coro, default, what: str):
+        """后端调用失败时退回默认值：状态页必须永远能返回 200。"""
+        try:
+            return await coro
+        except BackendError as exc:
+            logger.warning("状态页读取 %s 失败：%s", what, exc)
+            return default
+        except Exception as exc:
+            logger.warning("状态页读取 %s 异常：%s", what, exc)
+            return default
+
+    async def status_payload(self) -> dict:
+        """`GET /api/status` 的完整结构（契约第 9 节）。
+
+        盲区计数、群列表、缺口告警全部**现算**：后端只剩存储，
+        它不知道"盲区"是什么意思。
+        """
+        settings = self.settings
+        backend = self.backend
+        day = local_day()
+        now = now_ms()
+
+        health = await backend.health()
+        reachable = bool(health.get("reachable"))
+
+        stat: dict = {}
+        groups: list[dict] = []
+        alerts: list[dict] = []
+        unparsed_count = 0
+        conflict_count = 0
+        low_confidence_count = 0
+        digest_sent_count = 0
+
+        if reachable:
+            (
+                stat,
+                groups,
+                alerts,
+                unparsed_count,
+                conflict_count,
+                low_confidence_count,
+                digest_sent_count,
+            ) = await asyncio.gather(
+                self._safe(backend.get_stats(day), {}, "stats"),
+                self._safe(backend.list_groups(), [], "groups"),
+                self._safe(backend.list_gap_alerts(acknowledged=False, limit=20), [], "gap-alerts"),
+                self._safe(
+                    backend.count_messages(
+                        state=["unparsed", "degraded"],
+                        since=now - UNPARSED_WINDOW_DAYS * 24 * 3600 * 1000,
+                    ),
+                    0,
+                    "unparsed count",
+                ),
+                self._safe(backend.count_notifications(conflict=True), 0, "conflict count"),
+                self._safe(
+                    backend.count_notifications(
+                        low_confidence_below=settings.low_confidence_threshold
+                    ),
+                    0,
+                    "low confidence count",
+                ),
+                self._safe(
+                    backend.count_digest_logs(day=day, kind="auto", sent=True), 0, "digest log"
+                ),
+            )
+
+        return {
+            "onebot": self.hub.status(),
+            "llm": {
+                "extractor": settings.extractor,
+                "primary_model": settings.llm_primary_model,
+                "secondary_model": settings.llm_secondary_model or None,
+                "cross_check_enabled": settings.cross_check_enabled,
+                "vlm_enabled": settings.vlm_enabled,
+            },
+            "whitelist": {
+                "groups": [
+                    {"group_id": gid, "name": name}
+                    for gid, name in settings.group_display_names.items()
+                ],
+                "senders": [
+                    {"sender_id": sid, "name": name}
+                    for sid, name in settings.sender_whitelist_map.items()
+                ],
+                "sender_mode": settings.sender_whitelist_mode,
+            },
+            "pipeline": {
+                "today_ingested": int(stat.get("ingested") or 0),
+                "today_extracted": int(stat.get("extracted") or 0),
+                "today_unparsed": int(stat.get("unparsed") or 0),
+                "today_conflicts": int(stat.get("conflicts") or 0),
+                "today_degraded": int(stat.get("degraded") or 0),
+                "today_llm_tokens": int(stat.get("llm_tokens") or 0),
+                # bot 自己的运行时计数（不是后端的）
+                "queue_depth": self.pipeline.depth,
+                "processed": self.pipeline.processed,
+                "deferred": self.pipeline.dropped,
+                # 连原文都没能写进后端的消息条数。>0 就说明有东西真的可能有风险
+                "pending_retry": len(self.backend.pending),
+                "pending_retry_items": self.backend.pending.snapshot()[-5:],
+            },
+            "blindspots": {
+                "unparsed_count": unparsed_count,
+                "conflict_count": conflict_count,
+                "low_confidence_count": low_confidence_count,
+                "degraded_today": int(stat.get("degraded") or 0) > 0,
+                "window_days": UNPARSED_WINDOW_DAYS,
+            },
+            "groups": self._merge_groups(groups, now),
+            "gap_alerts": alerts,
+            "backend": health,
+            "recovery": self.last_recovery,
+            "digest": {
+                "enabled": settings.digest_enabled,
+                "time": settings.digest_time,
+                "target_qq": settings.digest_target_qq,
+                "sent_today": digest_sent_count > 0,
+            },
+            "day": day,
+            "server_time": now,
+        }
+
+    def _merge_groups(self, backend_groups: list[dict], now: int) -> list[dict]:
+        """后端 group_state 是真相来源，bot 的 GroupRegistry 只用来补群名。
+
+        群名缓存可以放内存（丢了会重新查，后端 group_state 里也有），
+        但**不能当真相来源** —— 它的 last_msg_ts 只覆盖 bot 这次启动之后见过的消息。
+        """
+        settings = self.settings
+        display = settings.group_display_names
+        rows: dict[str, dict] = {}
+
+        for g in backend_groups:
+            gid = str(g.get("group_id") or "")
+            if not gid:
+                continue
+            rows[gid] = {
+                "group_id": gid,
+                "group_name": g.get("group_name") or display.get(gid),
+                "in_whitelist": settings.in_group_whitelist(gid),
+                "last_msg_ts": g.get("last_msg_ts"),
+                "msg_count_today": g.get("msg_count_today"),
+            }
+
+        for g in self.normalizer.groups.snapshot():
+            gid = str(g.get("group_id") or "")
+            if not gid:
+                continue
+            row = rows.setdefault(
+                gid,
+                {
+                    "group_id": gid,
+                    "group_name": None,
+                    "in_whitelist": settings.in_group_whitelist(gid),
+                    "last_msg_ts": None,
+                    "msg_count_today": None,
+                },
+            )
+            row["group_name"] = row.get("group_name") or g.get("group_name")
+            row["last_msg_ts"] = row.get("last_msg_ts") or g.get("last_msg_ts")
+
+        # 白名单里配了但一直没消息的群也要出现在列表里（否则"配错了群号"永远看不见）
+        for gid in settings.group_whitelist_map:
+            rows.setdefault(
+                gid,
+                {
+                    "group_id": gid,
+                    "group_name": display.get(gid),
+                    "in_whitelist": True,
+                    "last_msg_ts": None,
+                    "msg_count_today": None,
+                },
+            )
+
+        out = []
+        for row in rows.values():
+            last = row.get("last_msg_ts")
+            row["last_msg_at"] = last
+            try:
+                row["silent_hours"] = round((now - int(last)) / 3600000, 2) if last else None
+            except (TypeError, ValueError):
+                row["silent_hours"] = None
+            out.append(row)
+        # 白名单内的排前面，然后按最近说话时间倒序
+        out.sort(key=lambda r: (not r["in_whitelist"], -(r.get("last_msg_ts") or 0)))
+        return out
 
 
 _runtime: BotRuntime | None = None
@@ -322,6 +638,12 @@ def get_runtime() -> BotRuntime:
     if _runtime is None:
         _runtime = BotRuntime()
     return _runtime
+
+
+def set_runtime(runtime: BotRuntime | None) -> None:
+    """自检工具用：把构造好的 runtime 挂上去（避免再建一个连真 NapCat 的 hub）。"""
+    global _runtime
+    _runtime = runtime
 
 
 # ---------------------------------------------------------------------------
@@ -352,12 +674,12 @@ api = APIRouter(prefix="/api")
 async def require_token(
     authorization: Annotated[str | None, Header()] = None,
 ) -> None:
-    """校验后端带来的 Bearer token。
+    """校验调用方带来的 Bearer token。
 
     为什么用普通依赖而不是中间件：这样每个路由的签名里都能看到"这里要认证"，
     将来加一个不需要认证的探活接口（比如 /healthz）也不会被误伤。
     """
-    token = get_settings().bot_api_token
+    token = get_settings().inbound_token
     if not token:
         return  # 空 token = 本地开发模式，启动时已经打过 WARNING
     if authorization != f"Bearer {token}":
@@ -379,7 +701,7 @@ class SendPrivateBody(BaseModel):
     @field_validator("user_id", mode="before")
     @classmethod
     def _coerce_id(cls, value: object) -> str:
-        # 后端可能把 QQ 号当数字发过来（JSON 里 10001 和 "10001" 都是合理的），
+        # 调用方可能把 QQ 号当数字发过来（JSON 里 10001 和 "10001" 都是合理的），
         # 这里统一成字符串，避免 pydantic v2 严格模式下直接 422。
         return "" if value is None else str(value)
 
@@ -404,37 +726,23 @@ class SendGroupBody(BaseModel):
         return "" if value is None else str(value)
 
 
+class DigestSendBody(BaseModel):
+    dry_run: bool = True
+
+
 # ---------------------------------------------------------------------------
 # 发送
 # ---------------------------------------------------------------------------
 
 
-def _check_send_result(resp: object) -> str | None:
-    """检查 OneBot 的 API 响应，失败时返回错误描述。
-
-    hub.call_api 拿到响应就算"调用成功"，但 NapCat 可能返回
-    status=failed / retcode!=0（比如"该群不存在"、"机器人被禁言"）。
-    这两种失败必须区分：前者是 bot 的问题，后者是 QQ 那边的问题。
-    """
-    if not isinstance(resp, dict):
-        return None
-    status = resp.get("status")
-    retcode = resp.get("retcode")
-    if status in (None, "ok") and retcode in (None, 0):
-        return None
-    detail = resp.get("message") or resp.get("wording") or f"retcode={retcode}"
-    return str(detail)
-
-
 async def _do_send(kind: str, target: str, message: str) -> dict:
     """统一的发送实现。**任何失败都返回 ok=false，不抛 500。**
 
-    后端要能区分两件事：
+    调用方要能区分两件事：
       - HTTP 4xx/5xx：bot 自己出问题了（token 不对、请求体不合法）；
       - {"ok": false, "error": ...}：bot 收到了请求，但发不出去
         （OneBot 没连上、QQ 那边拒绝）。
-    混成一个 500 的话，backend 的 digest 就只能记一句"调用失败"，
-    运维完全没法判断该去看 bot 还是看 NapCat。
+    混成一个 500 的话，运维完全没法判断该去看 bot 还是看 NapCat。
     """
     text = truncate(message or "", MESSAGE_MAX_CHARS, TRUNCATE_SUFFIX)
     if not target:
@@ -455,7 +763,7 @@ async def _do_send(kind: str, target: str, message: str) -> dict:
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
-    problem = _check_send_result(resp)
+    problem = interpret_send_result(resp)
     if problem:
         return {"ok": False, "error": f"NapCat 返回失败：{problem}"}
     return {"ok": True, "error": None}
@@ -478,12 +786,35 @@ async def send_group(body: SendGroupBody, _: AuthDep) -> dict:
 
 @api.get("/status")
 async def status(_: AuthDep) -> dict:
-    """给 backend 看"bot 到底活着没有、看得见哪些群"。
+    """给前端「系统状态」页用（契约第 9 节）。
 
-    last_event_at 用的是**事件**时间（含心跳），不是消息时间 ——
-    它回答的是"WS 还通吗"，而不是"群里有人在说话吗"。
+    后端不可达时也**必须返回 200**：页面要能显示"后端挂了"这件事本身，
+    所以 status_payload() 里每个后端调用都有兜底默认值。
     """
-    return get_runtime().status_payload()
+    return await get_runtime().status_payload()
+
+
+# ---------------------------------------------------------------------------
+# digest（契约第 8 节：后端不再提供，由 bot 组装 + 自己发）
+# ---------------------------------------------------------------------------
+
+
+@api.get("/digest/preview")
+async def digest_preview(_: AuthDep) -> dict:
+    runtime = get_runtime()
+    text = await build_digest(runtime.backend, runtime.settings)
+    return {"text": text}
+
+
+@api.post("/digest/send")
+async def digest_send(body: DigestSendBody, _: AuthDep) -> dict:
+    runtime = get_runtime()
+    return await send_digest(
+        dry_run=bool(body.dry_run),
+        kind="manual",
+        backend=runtime.backend,
+        sender=runtime.hub,
+    )
 
 
 app.include_router(api)

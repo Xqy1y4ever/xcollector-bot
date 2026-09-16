@@ -1,31 +1,48 @@
-"""调用 backend 的 HTTP 客户端。
+"""调用 backend 的 HTTP 客户端（契约见 xcollector-backend/docs/api.md）。
 
-两件事混在一起会很乱，所以这里分得很清楚：
+拆分之后后端是**纯数据层**：不做任何业务判断，只会增删查改。所以这个文件
+就是 bot 与存储之间的全部接口，也是"哪些知识存在 bot 里"的一份清单。
 
-  1. **单向转发**（ingest）：消息只往一个方向流，bot 不等 backend 的结果。
-     失败就重试，仍失败就丢弃 + 记 ERROR —— 绝不让 backend 的抖动
-     影响到 OneBot 的接收循环。
-  2. **交互式调用**（/add、/list、/done、/del）：用户在群里/私聊里等着回复，
-     所以**失败要快**（只试一次），并把错误翻译成一句人话给用户。
+三类调用，对"延迟 vs 成功率"的取舍完全不同：
 
-为什么要这么分：这两类请求对"延迟 vs 成功率"的取舍完全相反。
-转发可以为了不丢消息等 7 秒；指令让用户干等 7 秒只会显得机器人死了。
+  1. **写入**（create/patch message & notification、groups、stats、gap-alerts）：
+     走 `_write`，失败重试 `BACKEND_MAX_RETRIES` 次（退避 1s/2s/4s）。
+     契约保证所有写接口幂等，所以重试是安全的。
+  2. **交互式调用**（指令用）：用户在私聊里等着回复，**失败要快**（retries=0），
+     并把错误翻译成一句人话给用户。
+  3. **状态页调用**（/api/status、digest）：也不重试 —— 状态页要能**显示
+     "后端挂了"这件事本身**，为它等 7 秒是反效果。
+
+重试仍失败怎么办：**绝不静默丢**。两条路，按"原文有没有落库"分：
+  - 原文**没落库**（POST /api/messages 就失败了）：进内存待重试队列 +
+    一行带 `待重试=是` 的 ERROR，队列长度暴露在 /api/status 上；
+  - 原文**已落库**（后续步骤失败）：raw 会停在 `state=pending`，
+    由 pipeline.runner.resume_pending() 在启动 / 重连 / 每分钟的扫查里补处理，
+    这条路的寿命比进程长，是真正的主力。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 
 from .config import Settings, get_settings
+from .utils import now_ms
 
 logger = logging.getLogger(__name__)
 
 # 指数退避的起点：1s / 2s / 4s ...
 RETRY_BASE_DELAY = 1.0
 RETRY_MAX_DELAY = 30.0
+
+# 4xx 里"等一会儿可能就好了"的几个状态码。
+# 后端重启期间路由可能还没挂上（404/405），限流是 429 —— 这些值得重试。
+# 而 400/401/403/409/413/422 重试多少次结果都一样，早失败早报错。
+RETRYABLE_STATUS = {404, 405, 408, 425, 429}
 
 
 class BackendError(RuntimeError):
@@ -61,17 +78,103 @@ def _detail(resp: httpx.Response) -> str:
     return str(body)[:200]
 
 
+def _is_missing(exc: BackendError) -> bool:
+    """这次失败是不是"对象不存在"（404）。
+
+    404 在写接口里被当成"可重试"（后端刚重启时路由可能还没挂上），所以它
+    走到最后是以 BackendUnavailable 的形式抛出来的 —— 这里靠状态码认出来，
+    避免调用方去猜异常类型。
+    """
+    return exc.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 待重试队列
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PendingWrite:
+    """一条**连原文都没能写进后端**的消息，暂存在内存里等补写。
+
+    存的是归一化消息本身（不是"半截请求"）：补写时要整条重走一遍，
+    因为从头到尾所有写接口都是幂等的。
+    """
+
+    kind: str  # 目前只有 "message"
+    message: dict
+    note: str = ""
+    attempts: int = 0
+    first_failed_at: int = field(default_factory=now_ms)
+
+    def as_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "group_id": self.message.get("group_id"),
+            "message_id": self.message.get("message_id"),
+            "attempts": self.attempts,
+            "first_failed_at": self.first_failed_at,
+            "note": self.note,
+        }
+
+
+class PendingWrites:
+    """进程内待重试队列（只装"原文都没落库"的消息）。
+
+    为什么不落盘：bot 不允许持有需要跨重启存活的状态。原文没落库是**罕见**的
+    故障（后端 4xx / 一直不可达），配套动作是打 ERROR + 在 /api/status 的
+    `pipeline.pending_retry` 上暴露计数，而不是让 bot 为了它去维护一个本地库。
+    队列满时丢**最旧**的：最新的失败更接近当前故障，补写价值更高。
+    """
+
+    def __init__(self, maxlen: int = 200):
+        self.maxlen = maxlen
+        self._items: list[PendingWrite] = []
+        self.dropped = 0
+
+    def add(self, item: PendingWrite) -> PendingWrite:
+        self._items.append(item)
+        while len(self._items) > self.maxlen:
+            self._items.pop(0)
+            self.dropped += 1
+        return item
+
+    def items(self) -> list[PendingWrite]:
+        return list(self._items)
+
+    def remove(self, item: PendingWrite) -> None:
+        try:
+            self._items.remove(item)
+        except ValueError:
+            pass
+
+    def clear(self) -> None:
+        self._items.clear()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def snapshot(self) -> list[dict]:
+        return [i.as_dict() for i in self._items]
+
+
+# ---------------------------------------------------------------------------
+# 客户端
+# ---------------------------------------------------------------------------
+
+
 class BackendClient:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         headers: dict[str, str] = {}
-        if self.settings.ingest_api_token:
-            headers["Authorization"] = f"Bearer {self.settings.ingest_api_token}"
+        if self.settings.api_token:
+            headers["Authorization"] = f"Bearer {self.settings.api_token}"
         self._client = httpx.AsyncClient(
             base_url=self.settings.backend_base,
             timeout=self.settings.backend_timeout,
             headers=headers,
         )
+        self.pending = PendingWrites(self.settings.pending_write_max)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -86,22 +189,27 @@ class BackendClient:
         url: str,
         *,
         json: dict | None = None,
+        params: Any = None,
+        files: Any = None,
+        data: Any = None,
         purpose: str = "",
-        retries: int | None = None,
+        retries: int = 0,
         retry_on_4xx: bool = False,
     ) -> httpx.Response:
         """发一次请求，失败按指数退避重试。
 
-        retries = 重试次数（不含首次尝试）。退避序列 1s / 2s / 4s ...
+        retries = 重试次数（不含首次尝试）。默认 0：读接口和指令路径都不重试。
+        写接口请走 `_write`（它会填上 settings.backend_max_retries）。
         """
-        total = self.settings.backend_max_retries if retries is None else retries
-        attempts = max(1, int(total) + 1)
+        attempts = max(1, int(retries) + 1)
         delay = RETRY_BASE_DELAY
         last_error: BackendError | None = None
 
         for attempt in range(1, attempts + 1):
             try:
-                resp = await self._client.request(method, url, json=json)
+                resp = await self._client.request(
+                    method, url, json=json, params=params, files=files, data=data
+                )
             except Exception as exc:
                 # httpx 的超时/连接错误都是 Exception 子类；CancelledError 不是，
                 # 所以取消操作不会被这里吞掉。
@@ -111,12 +219,17 @@ class BackendClient:
                     return resp
 
                 detail = _detail(resp)
-                if resp.status_code < 500 and not retry_on_4xx:
-                    # 重试改变不了 4xx 的结果，而且可能重复副作用（比如重复建任务）
+                transient = resp.status_code >= 500 or resp.status_code in RETRYABLE_STATUS
+                if not transient and not retry_on_4xx:
+                    # 重试改变不了这个 4xx 的结果，而且可能重复副作用
                     raise BackendRejected(
                         f"HTTP {resp.status_code}: {detail}", resp.status_code
                     )
-                last_error = BackendUnavailable(f"HTTP {resp.status_code}: {detail}")
+                # 把状态码带上：重试耗尽后调用方仍然需要区分"404=没有这个对象"
+                # 和"真的连不上"（见 get_state / delete_state）
+                last_error = BackendUnavailable(
+                    f"HTTP {resp.status_code}: {detail}", resp.status_code
+                )
 
             if attempt < attempts:
                 logger.warning(
@@ -133,94 +246,552 @@ class BackendClient:
         assert last_error is not None
         raise last_error
 
-    # ------------------------------------------------------------------
-    # 单向：消息转发
-    # ------------------------------------------------------------------
+    async def _write(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict | None = None,
+        purpose: str = "",
+        retries: int | None = None,
+    ) -> httpx.Response:
+        """写接口：默认按 BACKEND_MAX_RETRIES 重试（1s/2s/4s）。"""
+        total = self.settings.backend_max_retries if retries is None else retries
+        return await self._request(
+            method, url, json=json, purpose=purpose, retries=total
+        )
 
-    async def ingest_messages(self, messages: list[dict]) -> bool:
-        """把一批归一化消息推给 backend。
-
-        返回是否成功。**不抛异常** —— 调用方是接收链路上的后台任务，
-        让它为了后端故障去处理异常没有意义，失败已经在这里记清楚了。
-        """
-        if not messages:
-            return True
+    async def _json(self, method: str, url: str, **kwargs: Any) -> Any:
+        resp = await self._request(method, url, **kwargs)
+        if not resp.content:
+            return {}
         try:
-            await self._request(
-                "POST",
-                "/api/ingest/messages",
-                json={"messages": messages},
-                purpose=f"ingest {len(messages)} 条",
-                # 转发链路上 4xx 也重试：多半是后端刚重启/路由还没挂上，
-                # 等一两秒再试往往就成功了。真正持续的 4xx 会在重试耗尽后记 ERROR。
-                retry_on_4xx=True,
-            )
-        except BackendError as exc:
-            logger.error(
-                "转发失败，丢弃 %d 条消息（已重试 %d 次）：%s",
-                len(messages),
-                self.settings.backend_max_retries,
-                exc,
-            )
-            return False
-        return True
+            return resp.json()
+        except Exception:
+            return {}
 
     # ------------------------------------------------------------------
-    # 交互：指令用
+    # 待重试
     # ------------------------------------------------------------------
 
-    async def create_manual_task(
+    def mark_for_retry(
         self,
         *,
-        text: str,
-        sender_id: str,
-        sender_name: str,
-        auto_commit: bool = True,
-        force_commit: bool = False,
-    ) -> dict:
-        """把用户手写的一句话交给后端解析成任务。"""
-        payload: dict = {
-            "text": text,
-            "sender_id": str(sender_id),
-            "sender_name": sender_name,
-            "auto_commit": auto_commit,
-        }
-        if force_commit:
-            payload["force_commit"] = True
-        resp = await self._request(
-            "POST",
-            "/api/tasks/manual",
-            json=payload,
-            purpose="tasks/manual",
-            retries=0,  # 用户在线等，不做退避重试
-        )
-        return resp.json()
+        message: dict,
+        note: str = "",
+    ) -> PendingWrite:
+        """把一条**连原文都没能写进后端**的消息放回内存队列，并留一行可 grep 的 ERROR。
 
-    async def list_notifications(self, *, status: str = "active", limit: int = 50) -> list[dict]:
-        """GET /api/notifications?status=active&limit=N → 通知列表。
+        只用于这种最坏情况（后端 4xx / 一直不可达）：消息在别处没有任何副本，
+        丢了就真丢了。已经落库、只是没处理完的消息**不走这里** —— 它们停在后端的
+        `state=pending` 上，由 pipeline.runner.resume_pending() 负责补处理，
+        那条路能扛住 bot 重启，比内存队列可靠。
 
-        查询参数拼在 URL 上（而不是走 httpx 的 params），是为了让所有请求
-        都从同一条 _request 路径出去 —— 重试和错误翻译只留一份实现。
+        调用方：pipeline/runner.py —— 只有它知道"这条消息已经走到哪一步了"。
         """
-        resp = await self._request(
-            "GET",
-            f"/api/notifications?status={status}&limit={int(limit)}",
-            purpose="notifications",
-            retries=0,  # 用户在线等，不做退避重试
+        item = self.pending.add(PendingWrite(kind="message", message=message, note=note))
+        logger.error(
+            "原文写入后端彻底失败，已标记待重试=是 | 群=%s(%s) | msg_id=%s | 原因=%s | 队列=%d",
+            message.get("group_name"),
+            message.get("group_id"),
+            message.get("message_id"),
+            note,
+            len(self.pending),
+        )
+        return item
+
+    # ------------------------------------------------------------------
+    # 消息 raw_message
+    # ------------------------------------------------------------------
+
+    async def create_message(self, payload: dict, *, retries: int | None = None) -> dict:
+        """POST /api/messages（按 (group_id, message_id) 幂等）→ {id, is_new}。"""
+        resp = await self._write(
+            "POST", "/api/messages", json=payload, purpose="messages", retries=retries
         )
         body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def get_message(self, message_id: str) -> dict:
+        body = await self._json("GET", f"/api/messages/{message_id}", purpose="messages")
+        return body if isinstance(body, dict) else {}
+
+    async def patch_message(self, message_id: str, payload: dict, *, retries: int | None = None) -> dict:
+        """PATCH /api/messages/{id} —— 只允许改 state 三个字段（契约保证）。"""
+        resp = await self._write(
+            "PATCH",
+            f"/api/messages/{message_id}",
+            json=payload,
+            purpose="messages.patch",
+            retries=retries,
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def list_messages(
+        self,
+        *,
+        state: str | list[str] | None = None,
+        group_id: str | None = None,
+        since: int | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        params = self._message_params(state=state, group_id=group_id, since=since, limit=limit)
+        body = await self._json("GET", "/api/messages", params=params, purpose="messages")
+        if isinstance(body, dict):
+            return body.get("messages") or []
+        return body or []
+
+    async def count_messages(
+        self,
+        *,
+        state: str | list[str] | None = None,
+        group_id: str | None = None,
+        since: int | None = None,
+    ) -> int:
+        """用契约的 `count_only=1` 数条数（盲区计数走这里）。"""
+        params = self._message_params(state=state, group_id=group_id, since=since)
+        params.append(("count_only", 1))
+        body = await self._json("GET", "/api/messages", params=params, purpose="messages.count")
+        return int((body or {}).get("count") or 0)
+
+    @staticmethod
+    def _message_params(
+        *,
+        state: str | list[str] | None = None,
+        group_id: str | None = None,
+        since: int | None = None,
+        limit: int | None = None,
+    ) -> list[tuple[str, Any]]:
+        # 用 list[tuple] 而不是 dict：state 需要重复出现（契约允许"可重复"）
+        params: list[tuple[str, Any]] = []
+        if state:
+            for s in ([state] if isinstance(state, str) else state):
+                params.append(("state", s))
+        if group_id:
+            params.append(("group_id", group_id))
+        if since is not None:
+            params.append(("since", int(since)))
+        if limit is not None:
+            params.append(("limit", int(limit)))
+        return params
+
+    # ------------------------------------------------------------------
+    # 通知 notification
+    # ------------------------------------------------------------------
+
+    async def create_notification(self, payload: dict, *, retries: int | None = None) -> dict:
+        """POST /api/notifications（按 raw_message_id 幂等）→ {id, created}。
+
+        evidence 为空会被后端 400 拒掉 —— 那条硬约束由后端替 bot 守着。
+        """
+        resp = await self._write(
+            "POST",
+            "/api/notifications",
+            json=payload,
+            purpose="notifications",
+            retries=retries,
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def patch_notification(self, notif_id: str, payload: dict, *, retries: int | None = None) -> dict:
+        resp = await self._write(
+            "PATCH",
+            f"/api/notifications/{notif_id}",
+            json=payload,
+            purpose="notifications.patch",
+            retries=retries,
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def list_notifications(
+        self,
+        *,
+        status: str = "all",
+        q: str | None = None,
+        since: int | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """GET /api/notifications → 读投影列表（人工修正已生效、status 已推导）。"""
+        params: list[tuple[str, Any]] = [("status", status), ("limit", int(limit))]
+        if q:
+            params.append(("q", q))
+        if since is not None:
+            params.append(("since", int(since)))
+        body = await self._json("GET", "/api/notifications", params=params, purpose="notifications")
         if isinstance(body, dict):
             return body.get("notifications") or []
         return body or []
 
+    async def get_notification(self, notif_id: str) -> dict:
+        body = await self._json(
+            "GET", f"/api/notifications/{notif_id}", purpose="notifications.get"
+        )
+        return body if isinstance(body, dict) else {}
+
+    async def delete_notification(self, notif_id: str, *, retries: int | None = None) -> dict:
+        resp = await self._write(
+            "DELETE",
+            f"/api/notifications/{notif_id}",
+            purpose="notifications.delete",
+            retries=retries,
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
     async def correct_notification(
         self, notif_id: str, *, field: str, value: object, user_id: str
     ) -> dict:
+        """POST /api/notifications/{id}/corrections —— 人工修正（只追加、留痕）。"""
         resp = await self._request(
             "POST",
             f"/api/notifications/{notif_id}/corrections",
             json={"field": field, "value": value, "user_id": user_id},
             purpose="corrections",
-            retries=0,
+            retries=0,  # 用户在线等
         )
-        return resp.json()
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def count_notifications(
+        self,
+        *,
+        status: str = "all",
+        conflict: bool | None = None,
+        low_confidence_below: float | None = None,
+    ) -> int:
+        """数通知条数。
+
+        只按 `status` 过滤时走契约的 `count_only=1`（一次请求一个数字）。
+        但契约的 `GET /api/notifications` **没有暴露 conflict / due_confidence
+        这两个过滤参数**，所以带这两个条件时只能在 bot 侧拉回来自己数 ——
+        盲区计数不能依赖后端没答应的参数（未知参数会被静默忽略，
+        那样数出来的是"全部通知"，会静默错得很离谱）。
+        """
+        if conflict is None and low_confidence_below is None:
+            params: list[tuple[str, Any]] = [("status", status), ("count_only", 1)]
+            body = await self._json(
+                "GET", "/api/notifications", params=params, purpose="notifications.count"
+            )
+            return int((body or {}).get("count") or 0)
+
+        rows = await self.list_notifications(status=status, limit=2000)
+        if conflict is not None:
+            rows = [r for r in rows if bool(r.get("conflict")) == bool(conflict)]
+        if low_confidence_below is not None:
+            rows = [
+                r
+                for r in rows
+                if 0 < float(r.get("due_confidence") or 0.0) < low_confidence_below
+            ]
+        return len(rows)
+
+    # ------------------------------------------------------------------
+    # 附件
+    # ------------------------------------------------------------------
+
+    async def upload_attachment(
+        self,
+        filename: str,
+        content: bytes,
+        content_type: str = "application/octet-stream",
+        source_url: str | None = None,
+    ) -> dict | None:
+        """POST /api/attachments（multipart/form-data）→ {id, url, size, content_type}。
+
+        **失败返回 None，不抛异常**：调用方（runner）据此把附件降级成
+        "只存 source_url"。为了一张图把整条通知丢掉是本末倒置。
+
+        重试说明：multipart 上传不是幂等的，5xx 之后重试可能在后端留下
+        两份字节（只多占点空间，不影响正确性 —— 最终记录的是后一次的 url）。
+        """
+        form: dict[str, str] = {"filename": filename or "file"}
+        if source_url:
+            form["source_url"] = source_url
+        files = {"file": (filename or "file", content, content_type)}
+        try:
+            resp = await self._request(
+                "POST",
+                "/api/attachments",
+                files=files,
+                data=form,
+                purpose=f"attachments({filename})",
+                retries=self.settings.backend_max_retries,
+            )
+        except BackendError as exc:
+            logger.warning("附件上传失败 %s（已降级为只存 source_url）：%s", filename, exc)
+            return None
+        try:
+            body = resp.json()
+        except Exception:
+            logger.warning("附件上传返回了非 JSON：%s", (resp.text or "")[:120])
+            return None
+        return body if isinstance(body, dict) else None
+
+    # ------------------------------------------------------------------
+    # 群状态
+    # ------------------------------------------------------------------
+
+    async def upsert_group(
+        self, group_id: str, group_name: str | None, last_msg_ts: int
+    ) -> dict:
+        """POST /api/groups → {group, previous_last_msg_ts}。
+
+        `previous_last_msg_ts` 由后端在**同一次写**里返回，bot 拿它做缺口检测，
+        省掉一次"读-判断-写"的竞态窗口。
+        """
+        resp = await self._write(
+            "POST",
+            "/api/groups",
+            json={
+                "group_id": str(group_id),
+                "group_name": group_name,
+                "last_msg_ts": int(last_msg_ts),
+            },
+            purpose="groups",
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def list_groups(self) -> list[dict]:
+        body = await self._json("GET", "/api/groups", purpose="groups")
+        if isinstance(body, dict):
+            return body.get("groups") or []
+        return body or []
+
+    # ------------------------------------------------------------------
+    # 缺口告警
+    # ------------------------------------------------------------------
+
+    async def create_gap_alert(
+        self,
+        *,
+        group_id: str,
+        group_name: str | None,
+        from_ts: int,
+        to_ts: int,
+        reason: str,
+    ) -> dict:
+        resp = await self._write(
+            "POST",
+            "/api/gap-alerts",
+            json={
+                "group_id": str(group_id),
+                "group_name": group_name,
+                "from_ts": int(from_ts),
+                "to_ts": int(to_ts),
+                "reason": reason,
+            },
+            purpose="gap-alerts",
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def list_gap_alerts(self, *, acknowledged: bool | None = None, limit: int = 20) -> list[dict]:
+        params: list[tuple[str, Any]] = [("limit", int(limit))]
+        if acknowledged is not None:
+            params.append(("acknowledged", "true" if acknowledged else "false"))
+        body = await self._json("GET", "/api/gap-alerts", params=params, purpose="gap-alerts")
+        if isinstance(body, dict):
+            return body.get("alerts") or []
+        return body or []
+
+    # ------------------------------------------------------------------
+    # 统计
+    # ------------------------------------------------------------------
+
+    async def add_stats(self, day: str | None, fields: dict[str, int]) -> dict:
+        """POST /api/stats —— 后端只做累加，不理解每个字段是什么意思。"""
+        payload: dict = {"fields": {k: int(v) for k, v in fields.items() if v}}
+        if day:
+            payload["day"] = day
+        resp = await self._write("POST", "/api/stats", json=payload, purpose="stats")
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def get_stats(self, day: str | None = None) -> dict:
+        params = [("day", day)] if day else None
+        body = await self._json("GET", "/api/stats", params=params, purpose="stats")
+        return body if isinstance(body, dict) else {}
+
+    # ------------------------------------------------------------------
+    # digest 发送记录（契约第 10 节）
+    # ------------------------------------------------------------------
+
+    async def add_digest_log(
+        self,
+        *,
+        day: str | None,
+        kind: str,
+        text: str,
+        sent: bool,
+        error: str | None = None,
+    ) -> dict:
+        payload: dict = {"kind": kind, "text": text, "sent": bool(sent), "error": error}
+        if day:
+            payload["day"] = day
+        resp = await self._write("POST", "/api/digest-log", json=payload, purpose="digest-log")
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def list_digest_logs(
+        self,
+        *,
+        day: str | None = None,
+        kind: str | None = None,
+        sent: bool | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        params = self._digest_log_params(day=day, kind=kind, sent=sent)
+        params.append(("limit", int(limit)))
+        body = await self._json("GET", "/api/digest-log", params=params, purpose="digest-log")
+        if isinstance(body, dict):
+            return body.get("logs") or []
+        return body or []
+
+    async def count_digest_logs(
+        self,
+        *,
+        day: str | None = None,
+        kind: str | None = None,
+        sent: bool | None = None,
+    ) -> int:
+        """只问一个数字：「今天 auto 且 sent=true 的有几条」。
+
+        digest 的"今天发过没有"必须问后端 —— bot 不允许持有跨重启存活的状态，
+        而重发对收件人是骚扰，比漏发更糟。
+        """
+        params = self._digest_log_params(day=day, kind=kind, sent=sent)
+        params.append(("count_only", 1))
+        body = await self._json(
+            "GET", "/api/digest-log", params=params, purpose="digest-log.count"
+        )
+        return int((body or {}).get("count") or 0)
+
+    @staticmethod
+    def _digest_log_params(
+        *, day: str | None, kind: str | None, sent: bool | None
+    ) -> list[tuple[str, Any]]:
+        params: list[tuple[str, Any]] = []
+        if day:
+            params.append(("day", day))
+        if kind:
+            params.append(("kind", kind))
+        if sent is not None:
+            params.append(("sent", "true" if sent else "false"))
+        return params
+
+    # ------------------------------------------------------------------
+    # bot 的键值暂存（契约第 11 节）
+    # ------------------------------------------------------------------
+
+    async def put_state(
+        self,
+        namespace: str,
+        key: str,
+        value: Any,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> dict:
+        """PUT /api/state/{namespace}/{key} —— 幂等 upsert。
+
+        这块是"带 TTL 的持久化草稿纸"：指令的待确认状态和 /list 的编号映射
+        必须跨重启存活，否则用户回 `y` 时那条待确认会凭空消失。
+        """
+        payload: dict = {"value": value}
+        if ttl_seconds is not None:
+            payload["ttl_seconds"] = int(ttl_seconds)
+        resp = await self._write(
+            "PUT",
+            f"/api/state/{namespace}/{key}",
+            json=payload,
+            purpose=f"state.{namespace}",
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def get_state(self, namespace: str, key: str) -> Any | None:
+        """GET /api/state/{namespace}/{key}。
+
+        **404 = 没有（或已过期），不是错误** —— 这是这个接口的正常返回值之一，
+        所以这里把 404 翻译成 None，让调用方少写一层 try。
+        """
+        try:
+            body = await self._json(
+                "GET",
+                f"/api/state/{namespace}/{key}",
+                purpose=f"state.{namespace}",
+            )
+        except BackendError as exc:
+            if _is_missing(exc):
+                return None
+            raise
+        if isinstance(body, dict):
+            return body.get("value")
+        return None
+
+    async def delete_state(self, namespace: str, key: str) -> bool:
+        try:
+            resp = await self._write(
+                "DELETE",
+                f"/api/state/{namespace}/{key}",
+                purpose=f"state.{namespace}",
+            )
+        except BackendError as exc:
+            if _is_missing(exc):
+                return True  # 已经不在了，语义上等价于删成功
+            raise
+        try:
+            return bool(resp.json().get("deleted"))
+        except Exception:
+            return True
+
+    async def list_state(self, namespace: str) -> list[dict]:
+        body = await self._json(
+            "GET", f"/api/state/{namespace}", purpose=f"state.{namespace}"
+        )
+        if isinstance(body, dict):
+            return body.get("items") or []
+        return body or []
+
+    # ------------------------------------------------------------------
+    # 健康
+    # ------------------------------------------------------------------
+
+    async def health(self) -> dict:
+        """GET /api/health —— **永远不抛异常**。
+
+        状态页需要能显示"后端挂了"这件事本身：抛异常只会变成 500，
+        前端就再也分不清"bot 挂了"和"后端挂了"。
+        """
+        result: dict[str, Any] = {
+            "reachable": False,
+            "base_url": self.settings.backend_base,
+            "error": None,
+        }
+        try:
+            resp = await self._request("GET", "/api/health", purpose="health", retries=0)
+            body = resp.json()
+        except BackendError as exc:
+            result["error"] = str(exc)
+            return result
+        except Exception as exc:  # 非 JSON / 意外结构
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            return result
+
+        if not isinstance(body, dict):
+            result["error"] = "后端返回了非对象结构"
+            return result
+        result.update(
+            {
+                "reachable": True,
+                "ok": bool(body.get("ok")),
+                "server_time": body.get("server_time"),
+                "storage": body.get("storage"),
+                "counts": body.get("counts"),
+                "version": body.get("version"),
+            }
+        )
+        return result
