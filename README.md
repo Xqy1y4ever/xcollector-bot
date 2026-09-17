@@ -75,7 +75,7 @@ QQ 群消息是**唯一不可再生的资产**（QQ 不会重发）。附件下�
 ## 2. 快速开始
 
 ```powershell
-cd E:\Xcollector\xcollector-bot
+cd xcollector-bot
 
 # 1) 虚拟环境（Python 3.12+；本机用 3.14 验证过）
 python -m venv .venv

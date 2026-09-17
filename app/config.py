@@ -167,8 +167,8 @@ class Settings(BaseSettings):
     def group_display_names(self) -> dict[str, str | None]:
         """群白名单的显示名；**没写名字时返回 None 而不是把群号当名字**。
 
-        `GROUP_WHITELIST=673504310` 这种写法很常见，如果直接把 id 当名字，
-        状态页就会显示「群名：673504310」，看起来像解析错了。
+        `GROUP_WHITELIST=123456789` 这种写法很常见，如果直接把 id 当名字，
+        状态页就会显示「群名：123456789」，看起来像解析错了。
         返回 None 之后前端会退化成显示群号，语义清楚得多。
         真实群名由 bot 通过 get_group_info 随消息带过来。
         """

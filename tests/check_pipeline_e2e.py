@@ -33,7 +33,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 # 双保险：本进程任何东西都不许去连真实 NapCat
 os.environ["ONEBOT_WS_URL"] = "ws://127.0.0.1:3999"
-os.environ["DIGEST_TARGET_QQ"] = "242684313"
+os.environ["DIGEST_TARGET_QQ"] = "10001"
 # bot 自己的入口也要有令牌（契约第 9 节：前端调 bot 用 BOT_API_TOKEN）
 os.environ["BOT_API_TOKEN"] = "bot-secret"
 
@@ -129,7 +129,7 @@ def make_settings(port: int, **overrides) -> Settings:
         sender_whitelist_mode="strict",
         onebot_ws_url="ws://127.0.0.1:3999",
         command_whitelist="10001:我",
-        digest_target_qq="242684313",
+        digest_target_qq="10001",
         pending_retry_interval=999,
         recovery_check_interval=999,
     )
@@ -161,11 +161,11 @@ def group_event(
         "message_type": "group",
         "sub_type": "normal",
         "message_id": message_id,
-        "group_id": 673504310,
+        "group_id": 123456789,
         "user_id": 10001,
         "self_id": 999999,
         "time": ts,
-        "sender": {"user_id": 10001, "nickname": "小李", "card": "李老师", "role": "admin"},
+        "sender": {"user_id": 10001, "nickname": "小李", "card": "张老师", "role": "admin"},
         "message": segments,
     }
 
@@ -322,7 +322,7 @@ async def test_group_message_flow(port: int) -> None:
         if rows:
             check("入库状态", rows[0]["state"], "extracted")
             check_true("正文含原文", "大家下周三前把军训心得交到班长那里" in rows[0]["content"], rows[0]["content"])
-            check("发送者用群名片", rows[0]["sender_name"], "李老师")
+            check("发送者用群名片", rows[0]["sender_name"], "张老师")
             check_true("附件已回填", len(rows[0]["attachments"]) == 1)
             if rows[0]["attachments"]:
                 att = rows[0]["attachments"][0]
@@ -379,7 +379,7 @@ async def test_filters(port: int) -> None:
     await backend.close()
 
     # 发送者在白名单 → 正常
-    settings2 = make_settings(port, sender_whitelist="10001:李老师")
+    settings2 = make_settings(port, sender_whitelist="10001:张老师")
     backend2 = BackendClient(settings2)
     reset_state()
     outcome = await ingest_message(
@@ -452,7 +452,7 @@ async def test_gap_detection(port: int) -> None:
     alert = list(fake_backend.STATE.gap_alerts.values())[0]
     check_true("缺口告警写明间隔", "16.0 小时" in alert["reason"], alert["reason"])
     # 恢复时不能把 last_msg_ts 拨回去（那会造出假的缺口）
-    check("group_state 的 last_msg_ts 是最后一条", fake_backend.STATE.groups["673504310"]["last_msg_ts"],
+    check("group_state 的 last_msg_ts 是最后一条", fake_backend.STATE.groups["123456789"]["last_msg_ts"],
           1757692800000 + 16 * 3600 * 1000)
     await backend.close()
 
@@ -471,10 +471,10 @@ async def test_crash_recovery(port: int) -> None:
     # 模拟"原文已落库、但重活没做"：直接往后端塞一条 pending
     body = {
         "message_id": "crash-1",
-        "group_id": "673504310",
-        "group_name": "NOVA官方通知群",
+        "group_id": "123456789",
+        "group_name": "示例通知群",
         "sender_id": "10001",
-        "sender_name": "李老师",
+        "sender_name": "张老师",
         "ts": 1757692800000,
         "content": "本周五19:00在教三201开班会，请全体同学准时参加。",
         "attachments": [],
@@ -576,7 +576,7 @@ async def test_blindspots(port: int) -> None:
         created = await backend.create_message(
             {
                 "message_id": f"blind-{i}",
-                "group_id": "673504310",
+                "group_id": "123456789",
                 "ts": 1789565000000,
                 "content": "看不清的公告",
                 "raw": {},
@@ -588,7 +588,7 @@ async def test_blindspots(port: int) -> None:
         await backend.create_notification(
             {
                 "raw_message_id": f"blind-notif-{i}",
-                "group_id": "673504310",
+                "group_id": "123456789",
                 "title": f"测试 {i}",
                 "due_at": 1789999999000,
                 "due_confidence": conf,
@@ -601,7 +601,7 @@ async def test_blindspots(port: int) -> None:
     old = await backend.create_message(
         {
             "message_id": "blind-old",
-            "group_id": "673504310",
+            "group_id": "123456789",
             "ts": 1789565000000 - 30 * 24 * 3600 * 1000,
             "content": "很久以前的公告",
             "raw": {},
@@ -812,7 +812,7 @@ async def test_digest(port: int) -> None:
     result = await send_digest(dry_run=False, kind="auto", backend=backend, sender=sender)
     check("真的发出去了", result["sent"], True)
     check("发送调用了一次私聊", len(sender.sent), 1)
-    check("收件人是 DIGEST_TARGET_QQ", sender.sent[0][0], "242684313")
+    check("收件人是 DIGEST_TARGET_QQ", sender.sent[0][0], "10001")
     check_true("发送后 sent_today=True", await sent_today(backend))
     check("auto 记录 sent=true", fake_backend.STATE.digest_logs[0]["sent"], True)
 
@@ -915,7 +915,7 @@ async def test_bot_api(port: int) -> None:
         check_true("day 形如 YYYY-MM-DD", len(payload["day"]) == 10 and payload["day"][4] == "-")
         check_true(
             "groups 里有那个群，且标了在不在白名单",
-            any(g["group_id"] == "673504310" and g["in_whitelist"] for g in payload["groups"]),
+            any(g["group_id"] == "123456789" and g["in_whitelist"] for g in payload["groups"]),
             str(payload["groups"])[:120],
         )
 

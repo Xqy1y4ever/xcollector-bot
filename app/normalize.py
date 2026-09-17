@@ -324,5 +324,5 @@ class MessageNormalizer:
 
 
 def display_group(group_id: str, group_name: str | None) -> str:
-    """日志里显示群：`NOVA官方通知群(673504310)` / `群673504310`。"""
+    """日志里显示群：`示例通知群(123456789)` / `群123456789`。"""
     return f"{group_name}({group_id})" if group_name else f"群{group_id}"

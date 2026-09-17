@@ -46,14 +46,14 @@ FAKE_EVENT: dict = {
     "message_type": "group",
     "sub_type": "normal",
     "message_id": 12345,
-    "group_id": 673504310,
+    "group_id": 123456789,
     "user_id": 10001,
     "self_id": 999999,
     "time": 1757692800,  # 秒；归一化后应变成 1757692800000
     "sender": {
         "user_id": 10001,
         "nickname": "小李",
-        "card": "李老师",  # card 必须赢过 nickname
+        "card": "张老师",  # card 必须赢过 nickname
         "role": "admin",
     },
     "message": [
@@ -96,8 +96,8 @@ FORWARD_FIXTURES: dict[str, list[dict]] = {
 }
 
 GROUP_INFO = {
-    "group_id": 673504310,
-    "group_name": "NOVA官方通知群",
+    "group_id": 123456789,
+    "group_name": "示例通知群",
     "member_count": 200,
 }
 
@@ -251,7 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--to-self", action="store_true", help="改为向 bot 的 /api/send/private 发消息")
     parser.add_argument("--bot-url", default=None, help="bot 的地址（默认读配置）")
     parser.add_argument("--bot-token", default=None, help="bot 的 BOT_API_TOKEN")
-    parser.add_argument("--to-self-user", default="242684313", help="假消息的接收 QQ 号")
+    parser.add_argument("--to-self-user", default="10001", help="假消息的接收 QQ 号")
     parser.add_argument(
         "--to-self-message",
         default="[自检] 这是一条来自 send_test 的假消息",
