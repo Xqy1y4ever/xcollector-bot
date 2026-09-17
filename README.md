@@ -257,7 +257,7 @@ bot 回「编号列表已过期或还没生成，请先发 /list 刷新列表」
 ### 5.2 bot → 后端
 
 基础地址 `BACKEND_BASE_URL`，认证头 `Authorization: Bearer <API_TOKEN>`
-（整套系统只有一个共享密钥，两边都叫 `API_TOKEN`）。契约见
+（**写入令牌**，两边都叫 `API_TOKEN`）。契约见
 `xcollector-backend/docs/api.md`。bot 用到的接口：
 
 `POST/GET/PATCH /api/messages`、`POST/GET/PATCH/DELETE /api/notifications`、

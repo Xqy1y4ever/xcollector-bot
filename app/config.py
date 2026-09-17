@@ -73,10 +73,16 @@ class Settings(BaseSettings):
     bot_listen_host: str = "127.0.0.1"
     bot_listen_port: int = 8082
     bot_api_token: str = ""
+    # 网页令牌：前端登录页用。对本服务只能调 GET /api/status 与
+    # GET /api/digest/preview —— 发消息类的接口一律 403（见 app/auth.py）。
+    # 留空 = 退回单令牌模式（管理令牌同时当网页令牌用）。
+    # 必须与 backend 的 WEB_API_TOKEN 是**同一个值**（有自检脚本守这条）。
+    web_api_token: str = ""
 
     # ---------------- 后端（纯数据层）----------------
     backend_base_url: str = "http://127.0.0.1:8000"
-    # 调后端时带的令牌。契约里整套系统**只有一个共享密钥**，两边都叫 API_TOKEN，
+    # 调后端时带的令牌。必须是**写入令牌**（契约里两边都叫 API_TOKEN），
+    # 网页令牌调写接口会拿到 403。见 app/auth.py。
     # 所以这里不再有 INGEST_API_TOKEN 这个第二名字。
     api_token: str = ""
     backend_timeout: float = 15.0
@@ -191,12 +197,20 @@ class Settings(BaseSettings):
 
     @property
     def inbound_token(self) -> str:
-        """本服务 /api/* 的认证令牌。
+        """本服务 /api/* 的**写入**令牌（管理令牌）。
 
-        契约说整套系统只有一个共享密钥（都叫 API_TOKEN），所以允许
-        BOT_API_TOKEN 留空时退化用 API_TOKEN —— 少配一个密钥就少一处配错的机会。
+        契约说共享密钥都叫 API_TOKEN，所以允许 BOT_API_TOKEN 留空时退化用
+        API_TOKEN —— 少配一个密钥就少一处配错的机会。
+        **这个值不要给浏览器。**
         """
         return self.bot_api_token or self.api_token
+
+    @property
+    def web_scope_separated(self) -> bool:
+        """网页令牌与管理令牌是否**真的**分开了。配成同一个值等于没拆。"""
+        web = self.web_api_token.strip()
+        write = self.inbound_token.strip()
+        return bool(write and web and web != write)
 
     @property
     def backend_base(self) -> str:

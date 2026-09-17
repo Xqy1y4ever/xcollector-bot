@@ -36,6 +36,9 @@ os.environ["ONEBOT_WS_URL"] = "ws://127.0.0.1:3999"
 os.environ["DIGEST_TARGET_QQ"] = "10001"
 # bot 自己的入口也要有令牌（契约第 9 节：前端调 bot 用 BOT_API_TOKEN）
 os.environ["BOT_API_TOKEN"] = "bot-secret"
+# 网页令牌：与上面的管理令牌**故意不同**，用来验证"网页只能看、不能发消息"。
+# 两个配成一样的话，下面第 10 节的断言会全部落到写入范围，等于没测。
+os.environ["WEB_API_TOKEN"] = "web-secret"
 
 from app import config  # noqa: E402
 from app.backend_client import BackendClient  # noqa: E402
@@ -230,6 +233,26 @@ class StubSender:
 
     def last(self) -> str:
         return self.sent[-1][1] if self.sent else ""
+
+
+class RecordingHub(FakeHub):
+    """FakeHub + 记录发送动作。
+
+    用来断言"被权限挡掉的请求**一个字节都没发出去**" —— 只看 HTTP 403 是不够的，
+    真正要证明的是它没有副作用。FakeHub 本身没有 send_* 方法，所以这里补上。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent: list[tuple[str, str]] = []
+
+    async def send_private_msg(self, user_id: str, message: str) -> dict:
+        self.sent.append((f"private:{user_id}", message))
+        return {"status": "ok", "retcode": 0}
+
+    async def send_group_msg(self, group_id: str, message: str) -> dict:
+        self.sent.append((f"group:{group_id}", message))
+        return {"status": "ok", "retcode": 0}
 
 
 async def wait_for(predicate, timeout: float = 10.0) -> bool:
@@ -938,6 +961,70 @@ async def test_bot_api(port: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 10. bot 自己的接口也要分范围：网页令牌不能发消息
+# ---------------------------------------------------------------------------
+
+
+async def test_bot_scopes(port: int) -> None:
+    print("\n=== 10. 网页令牌 vs 管理令牌（bot 自己的 /api）===")
+    import httpx
+
+    from app import main as main_mod
+
+    settings = make_settings(port)
+    reset_state()
+    runtime = main_mod.BotRuntime(settings)
+    runtime.hub = RecordingHub()  # type: ignore[assignment]
+    main_mod.set_runtime(runtime)
+
+    write_h = {"Authorization": "Bearer bot-secret"}
+    web_h = {"Authorization": "Bearer web-secret"}
+
+    transport = httpx.ASGITransport(app=main_mod.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://bot") as client:
+        # 读：两种令牌都该放行
+        for label, h in [("管理令牌", write_h), ("网页令牌", web_h)]:
+            r = await client.get("/api/status", headers=h)
+            check(f"{label} GET /api/status → 200", r.status_code, 200)
+            r = await client.get("/api/digest/preview", headers=h)
+            check(f"{label} GET /api/digest/preview → 200", r.status_code, 200)
+
+        # 写：网页令牌一律 403（**不是** 401 —— 身份有效，只是没权限）
+        writes = [
+            ("POST", "/api/digest/send", {"dry_run": True}),
+            ("POST", "/api/send/private", {"user_id": "10001", "message": "hi"}),
+            ("POST", "/api/send/group", {"group_id": "123456789", "message": "hi"}),
+        ]
+        for method, path, body in writes:
+            r = await client.request(method, path, json=body, headers=web_h)
+            check(f"网页令牌 {method} {path} → 403", r.status_code, 403)
+            detail = (r.json() or {}).get("detail", "") if r.status_code == 403 else ""
+            check_true(f"{path} 的 403 说明了原因", "只允许持有管理令牌" in detail, repr(detail))
+
+        # 最关键的一条：网页令牌发私聊时，**一个字节都不许发出去**
+        before = len(runtime.hub.sent)  # type: ignore[attr-defined]
+        await client.post(
+            "/api/send/private", json={"user_id": "10001", "message": "冒充"}, headers=web_h
+        )
+        check(
+            "网页令牌被拒后没有真的发消息",
+            len(runtime.hub.sent),  # type: ignore[attr-defined]
+            before,
+        )
+
+        # 管理令牌仍然能发（dry_run 只是走一遍组装，不真发）
+        r = await client.post("/api/digest/send", json={"dry_run": True}, headers=write_h)
+        check("管理令牌 POST /api/digest/send → 200", r.status_code, 200)
+
+        # 坏令牌仍然是 401（和 403 区分开）
+        r = await client.get("/api/status", headers={"Authorization": "Bearer nope"})
+        check("坏令牌 → 401", r.status_code, 401)
+
+    await runtime.backend.close()
+    main_mod.set_runtime(None)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -957,6 +1044,7 @@ async def run_all() -> int:
         await test_digest(port)
         await test_auth(port)
         await test_bot_api(port)
+        await test_bot_scopes(port)
     finally:
         await stop_fake_backend(server, task)
 

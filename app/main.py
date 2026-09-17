@@ -24,10 +24,11 @@ from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, WebSocket
 from pydantic import BaseModel, field_validator
 
 from . import __version__
+from .auth import Scope, require_token, require_write
 from .backend_client import BackendClient, BackendError
 from .commands import CommandRouter
 from .config import Settings, get_settings
@@ -347,6 +348,16 @@ class BotRuntime:
             # 这条 WARNING 是刻意留的：/api/send/* 能冒充机器人发言，
             # 忘了配 token 就等于把它暴露给任何能访问这个端口的人。
             logger.warning("BOT_API_TOKEN / API_TOKEN 均为空：/api/* 不校验认证，仅限本地开发使用")
+        elif settings.web_scope_separated:
+            logger.info(
+                "网页令牌已分离：WEB_API_TOKEN 只能看 /api/status 与 /api/digest/preview，"
+                "发消息类接口（send/*、digest/send）只认管理令牌"
+            )
+        else:
+            logger.warning(
+                "WEB_API_TOKEN 未配置（或与管理令牌相同）：网页那个令牌拥有**完整权限**，"
+                "包括以你的身份发 QQ 消息。请单独设一个不同的 WEB_API_TOKEN。"
+            )
         if not settings.command_whitelist_map:
             logger.warning("COMMAND_WHITELIST 为空：当前没有任何 QQ 号能发指令")
 
@@ -667,26 +678,16 @@ api = APIRouter(prefix="/api")
 
 
 # ---------------------------------------------------------------------------
-# 认证
+# 认证：实现见 app/auth.py
+#
+# 两个范围：管理令牌（BOT_API_TOKEN / API_TOKEN）什么都能调；网页令牌
+# （WEB_API_TOKEN）只能看状态和预览摘要 —— 发消息类的接口一律 403。
+# 理由：网页令牌要给登录页，而"任何人拿到它就能以你的身份发 QQ 消息"
+# 是比"能改数据库"更直接的后果。
 # ---------------------------------------------------------------------------
 
-
-async def require_token(
-    authorization: Annotated[str | None, Header()] = None,
-) -> None:
-    """校验调用方带来的 Bearer token。
-
-    为什么用普通依赖而不是中间件：这样每个路由的签名里都能看到"这里要认证"，
-    将来加一个不需要认证的探活接口（比如 /healthz）也不会被误伤。
-    """
-    token = get_settings().inbound_token
-    if not token:
-        return  # 空 token = 本地开发模式，启动时已经打过 WARNING
-    if authorization != f"Bearer {token}":
-        raise HTTPException(status_code=401, detail="无效的 BOT_API_TOKEN")
-
-
-AuthDep = Annotated[None, Depends(require_token)]
+AuthDep = Annotated[Scope, Depends(require_token)]
+WriteDep = Annotated[Scope, Depends(require_write)]
 
 
 # ---------------------------------------------------------------------------
@@ -770,12 +771,12 @@ async def _do_send(kind: str, target: str, message: str) -> dict:
 
 
 @api.post("/send/private")
-async def send_private(body: SendPrivateBody, _: AuthDep) -> dict:
+async def send_private(body: SendPrivateBody, _: WriteDep) -> dict:
     return await _do_send("private", body.user_id, body.message)
 
 
 @api.post("/send/group")
-async def send_group(body: SendGroupBody, _: AuthDep) -> dict:
+async def send_group(body: SendGroupBody, _: WriteDep) -> dict:
     return await _do_send("group", body.group_id, body.message)
 
 
@@ -807,7 +808,7 @@ async def digest_preview(_: AuthDep) -> dict:
 
 
 @api.post("/digest/send")
-async def digest_send(body: DigestSendBody, _: AuthDep) -> dict:
+async def digest_send(body: DigestSendBody, _: WriteDep) -> dict:
     runtime = get_runtime()
     return await send_digest(
         dry_run=bool(body.dry_run),
