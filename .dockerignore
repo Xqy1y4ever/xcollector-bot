@@ -6,7 +6,10 @@ __pycache__/
 !.env.example
 *.log
 .git/
+.github/
 .gitignore
 .gitattributes
+Dockerfile
+.dockerignore
 .pipprobe/
 .pytest_cache/
