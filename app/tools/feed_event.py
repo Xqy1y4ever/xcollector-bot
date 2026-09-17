@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=None)
     parser.add_argument("--retries", type=int, default=None)
     parser.add_argument(
-        "--extractor", default="rule", help="rule/llm/both（默认 rule：不需要 litellm）"
+        "--extractor", default="rule", help="rule/llm/both（默认 rule：不调用模型）"
     )
     parser.add_argument("--no-media", action="store_true", help="不下载附件")
     args = parser.parse_args(argv)

@@ -66,28 +66,6 @@ class LLMNotification(BaseModel):
     evidence: str = ""
 
 
-_LITELLM_CONFIGURED = False
-
-
-def _configure_litellm() -> None:
-    """导入 litellm 之后再关掉剩余的联网 / 噪音开关。
-
-    价格表那一项必须在**导入前**用环境变量关（见 app/__init__.py），
-    这里处理的是导入之后才可写的模块属性。
-    """
-    global _LITELLM_CONFIGURED
-    if _LITELLM_CONFIGURED:
-        return
-    try:
-        import litellm
-
-        litellm.telemetry = False
-        litellm.suppress_debug_info = True
-    except Exception:  # 只是降噪，失败无所谓
-        pass
-    _LITELLM_CONFIGURED = True
-
-
 def _strip_code_fence(text: str) -> str:
     t = text.strip()
     if t.startswith("```"):
@@ -137,9 +115,7 @@ async def _call_model(
     use_json_mode: bool = True,
 ) -> tuple[LLMNotification, int]:
     """调用一次模型，返回 (解析结果, 消耗 token 数)。失败抛异常。"""
-    from litellm import acompletion  # 延迟导入：litellm 加载较慢，且是可选的
-
-    _configure_litellm()
+    from app.llm import acompletion  # 延迟导入，保持模块导入链轻量
 
     settings = get_settings()
     local_ts = to_local(raw["ts"])
@@ -152,23 +128,16 @@ async def _call_model(
         {"role": "system", "content": system},
         {"role": "user", "content": _build_user_content(raw, images)},
     ]
-    kwargs: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": settings.llm_temperature,
-        "timeout": settings.llm_timeout,
-    }
-    if use_json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
 
-    resp = await acompletion(**kwargs)
-    content = resp.choices[0].message.content or ""
-    tokens = 0
-    usage = getattr(resp, "usage", None)
-    if usage is not None:
-        tokens = int(getattr(usage, "total_tokens", 0) or 0)
-    data = _extract_json(content)
-    return LLMNotification(**data), tokens
+    result = await acompletion(
+        model=model,
+        messages=messages,
+        temperature=settings.llm_temperature,
+        timeout=settings.llm_timeout,
+        response_format={"type": "json_object"} if use_json_mode else None,
+    )
+    data = _extract_json(result.text)
+    return LLMNotification(**data), result.total_tokens
 
 
 async def run_llm(raw: dict, images: list[str], model: str) -> tuple[LLMNotification, int]:

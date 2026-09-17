@@ -12,7 +12,7 @@
 
 写后端那一步现在走的是**真流水线**（pipeline.runner.ingest_message）：
 写前日志 → 附件 → 抽取 → 建通知 → 统计。
-默认 `--extractor rule`，因为这台机器上不一定装得了 litellm。
+默认 `--extractor rule`，这样不发任何模型请求就能把链路跑通。
 """
 
 from __future__ import annotations
@@ -245,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--forward-fail", action="store_true", help="模拟合并转发展开失败，验证降级文案"
     )
     parser.add_argument(
-        "--extractor", default="rule", help="rule/llm/both（默认 rule：不需要 litellm）"
+        "--extractor", default="rule", help="rule/llm/both（默认 rule：不调用模型）"
     )
     parser.add_argument("--no-media", action="store_true", help="不下载附件")
     parser.add_argument("--to-self", action="store_true", help="改为向 bot 的 /api/send/private 发消息")

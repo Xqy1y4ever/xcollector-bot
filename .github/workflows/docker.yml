@@ -70,9 +70,5 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             PYTHON_VERSION=${{ vars.PYTHON_VERSION || '3.12' }}
-            # 1 = 把 litellm 一起装进镜像。默认开，这样 EXTRACTOR=llm 开箱可用；
-            # 只在用规则抽取、想省几百 MB 时，去仓库 Settings → Variables 里
-            # 加一个 BUILD_LLM=0。
-            BUILD_LLM=${{ vars.BUILD_LLM || '1' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

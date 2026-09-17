@@ -19,13 +19,9 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY requirements.txt ./
-# 核心链路（EXTRACTOR=rule）不依赖 litellm，所以默认只装 core。
-# 要启用 LLM 抽取：把下面的 requirements-llm.txt 一起装，
-# 或在 compose 里把 BUILD_LLM 设为 1（见 docker-compose.yml）。
-ARG BUILD_LLM=0
-COPY requirements-llm.txt ./
-RUN pip install -r requirements.txt \
-    && if [ "$BUILD_LLM" = "1" ]; then pip install -r requirements-llm.txt; fi
+# LLM 抽取走 app/llm/ 里的自研网关，它只依赖 httpx（已经在这里了），
+# 所以没有"可选的 LLM 依赖"这回事 —— 一次装完，没有构建开关。
+RUN pip install -r requirements.txt
 
 COPY app ./app
 COPY tests ./tests

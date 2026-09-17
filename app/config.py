@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     sender_whitelist_mode: Literal["strict", "off"] = "strict"
 
     # ---------------- 抽取 ----------------
-    # rule=只跑规则（不依赖 litellm）；llm=只跑模型；both=模型 + 规则交叉判断
+    # rule=只跑规则（不调用模型）；llm=只跑模型；both=模型 + 规则交叉判断
     extractor: Literal["llm", "rule", "both"] = "llm"
     llm_primary_model: str = "deepseek/deepseek-chat"
     llm_secondary_model: str = ""

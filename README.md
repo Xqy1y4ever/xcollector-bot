@@ -80,10 +80,8 @@ cd xcollector-bot
 # 1) 虚拟环境（Python 3.12+；本机用 3.14 验证过）
 python -m venv .venv
 
-# 2) 核心依赖（不含 litellm）
+# 2) 依赖（一次装完，LLM 抽取没有额外依赖）
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-#    需要 LLM 抽取时再装：
-# .\.venv\Scripts\python.exe -m pip install -r requirements-llm.txt
 
 # 3) 配置
 Copy-Item .env.example .env
@@ -96,8 +94,40 @@ Copy-Item .env.example .env
 **没有任何配置也能启动**：所有项都有默认值。没连上 NapCat 时 `/api/status` 会返回
 `onebot.connected=false` 并带上 `last_error` —— 这本身就是一个可用的自检结果。
 
-> `EXTRACTOR=rule` 时整条链路**完全不依赖 litellm**：核心是"收到消息 → 入库 →
-> 建通知 → digest"，模型只是提高召回率。装不上 litellm 的机器请用 `EXTRACTOR=rule`。
+> `EXTRACTOR=rule` 时整条链路完全不碰模型：核心是"收到消息 → 入库 →
+> 建通知 → digest"，模型只是提高召回率。**LLM 抽取不需要额外装任何东西** ——
+> 多厂商调用走 `app/llm/` 里自己写的网关，只用到本来就有的 `httpx`。
+
+### 换模型 / 接自己的网关（`app/llm/`）
+
+模型名写成 `厂商/模型名`，网关自己认前缀并选协议，**不需要改代码、也不需要装 SDK**：
+
+```bash
+LLM_PRIMARY_MODEL=deepseek/deepseek-chat        # DeepSeek（OpenAI 格式）
+LLM_PRIMARY_MODEL=google/gemini-2.5-flash       # Gemini（Google 原生 generateContent）
+LLM_PRIMARY_MODEL=openrouter/anthropic/claude-sonnet-4
+LLM_PRIMARY_MODEL=myproxy/qwen3-32b             # 自建/公司内网关
+```
+
+- 内置厂商和对应的 key 环境变量见 `app/llm/providers.py`（也列在 `.env.example` 里）。
+- **base URL 可覆盖**：`{厂商名大写}_API_BASE`，例如 `DEEPSEEK_API_BASE=https://proxy.example.com/v1`
+  —— 走代理、走中转站、换私有部署都靠它。
+- **没注册过的前缀也能用**：只要配上 `{前缀大写}_API_BASE`，就按 OpenAI 兼容端点处理
+  （加上 `{前缀大写}_API_KEY` 如果它要鉴权）。所以接任何自建服务都不用改这个仓库。
+- `LLM_SECONDARY_MODEL` 填另一个厂商的模型就能启用交叉验证，两个模型对 `due_at`
+  不一致时会把置信度压到 0.5 并标记 `conflict`（宁可疑，不装懂）。
+
+`app/llm/` 是**自己写的**（约 400 行，只依赖本来就有的 `httpx`），没有用 litellm：
+我们只需要「用统一格式调几个厂商的 chat 接口」这一件事，而 litellm 会拖进
+openai / tokenizers / tiktoken / aiohttp / jsonschema 一整棵依赖树，镜像多出上百 MB。
+
+网关刻意**只做单次尝试、不做重试** —— 重试策略（第一次用 JSON 模式、失败退回普通模式）
+在 `pipeline/extract.py::run_llm` 里，那里才知道业务规则；网关层再重试只会和它打架、
+让超时失控。失败时抛的 `LLMError` 带 `status`，上层据此判断值不值得重试。
+
+> 图片：OpenAI 侧原样传 `image_url` + data URL；Google 侧转成 `inlineData`。
+> Google 原生接口读不了任意 http 图片地址，这时**降级成一句占位文本并打 WARNING**
+> —— 宁可少一张图，也不能让整条消息抽取不出来；但也绝不静默丢，否则就是悄悄漏 DDL。
 
 ### 两个端口，别搞混（最常见的配置事故）
 
@@ -257,7 +287,25 @@ bot 回「编号列表已过期或还没生成，请先发 /list 刷新列表」
 .\.venv\Scripts\python.exe -m tests.check_timeparse     # 中文相对时间，18 条
 .\.venv\Scripts\python.exe -m tests.check_location      # 规则抽取地点，14 条
 .\.venv\Scripts\python.exe -m tests.check_commands      # 指令解析与排版（纯函数）
+.\.venv\Scripts\python.exe -m tests.check_llm_gateway   # LLM 网关的线上格式，96 条
 ```
+
+`check_llm_gateway` 会起一个**真的本地 HTTP 服务**当假厂商（不是 mock transport，
+否则测不出 URL 和 header 拼错），把两种协议的请求和响应都验一遍，并且**完全不联网**。
+
+### 6.1b 模型配置自检（要联网，只发 3 次请求）
+
+```powershell
+.\.venv\Scripts\python.exe -m app.tools.check_llm
+.\.venv\Scripts\python.exe -m app.tools.check_llm --model google/gemini-2.5-flash
+```
+
+逐层验：模型名解析 → key 有没有配 → 连通性 → JSON 模式 → **真实抽取链路**
+（拿两条样例通知跑完整的 `extract_with_llm`）。任何一层不通就非 0 退出。
+
+这条命令存在的理由就是这条工作流最大的风险不是「模型答错」，而是
+**「模型静默不可用」**：key 过期、余额耗尽、模型名写错、反代把 base URL
+改坏了，你却不知道，直到某天发现漏了一堆通知。配好之后先跑一遍。
 
 ### 6.2 端到端（真 bot 代码 + 假后端，推荐先跑这个）
 

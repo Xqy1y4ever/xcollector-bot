@@ -331,7 +331,7 @@ async def parse_content(
     rule_result = rule_extract(content, ts, at_all=bool(raw.get("at_all")))
 
     if settings.extractor == "rule":
-        # 核心链路在 EXTRACTOR=rule 时完全不碰 litellm（它可能根本没装）
+        # 核心链路在 EXTRACTOR=rule 时完全不发任何网络请求给模型厂商
         return rule_result, False, 0
 
     try:

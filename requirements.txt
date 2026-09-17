@@ -3,10 +3,9 @@
 # 这个仓库现在是**消息处理层**：连 OneBot、筛选、抽取、digest、附件、统计全在这里，
 # 后端退化成纯 CRUD 数据层。
 #
-# ⚠️ 这里**刻意不含 litellm**：核心链路在 EXTRACTOR=rule 时不碰任何模型，
-#    所以不装 litellm 也能把「收到消息 → 入库 → 建通知 → digest」整条跑通。
-#    要跑 LLM 抽取请装：
-#        .\.venv\Scripts\python.exe -m pip install -r requirements-llm.txt
+# ⚠️ LLM 抽取所需的依赖**已经全在这里了**：多厂商调用走 app/llm/ 里自己写的
+#    网关（支持 OpenAI 格式和 Google 原生格式），它只用到 httpx。
+#    所以没有 requirements-llm.txt 这个东西，也没有构建开关 —— 一次装完即可。
 
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
