@@ -9,6 +9,10 @@ Xcollector 的**消息处理层**。它独占 OneBot(NapCat) 连接，把 QQ 群
 它是整套系统里唯一有「业务判断」的地方 —— 什么算通知、截止时间对不对、
 今天有没有漏消息，都在这里决定。
 
+> **项目主页与部署入口在
+> [`xcollector-deploy`](https://github.com/Xqy1y4ever/xcollector-deploy)**
+> —— 想看这套系统整体怎么跑、怎么装，从那里开始。
+
 ## 技术栈
 
 | | |
@@ -61,11 +65,12 @@ QQ 群 ──▶ NapCat ──OneBot WS──▶ xcollector-bot ──HTTP──
 ### Docker（推荐）
 
 镜像由 CI 构建推送到 GHCR，编排在
-[`xcollector-deploy`](../xcollector-deploy/) 仓库里。bot 只发布到本机端口，
-NapCat 与前端通过它访问。
+[`xcollector-deploy`](https://github.com/Xqy1y4ever/xcollector-deploy) 仓库里。
+bot 只发布到本机端口，NapCat 与前端通过它访问。
 
 ```bash
-cd ../xcollector-deploy
+git clone https://github.com/Xqy1y4ever/xcollector-deploy.git
+cd xcollector-deploy
 cp .env.example .env     # 填两个令牌、群白名单、ONEBOT_*
 sh preflight.sh
 docker compose up -d
