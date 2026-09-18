@@ -96,17 +96,48 @@ class Settings(BaseSettings):
     pending_retry_max_attempts: int = 5
 
     # ---------------- 群 / 发送者白名单 ----------------
-    # 群白名单为空 = 不限制（方便首次跑通）；发送者白名单为空 = 不限制
+    # **两个都是白名单，留空 = 谁都不放行。** bot 只处理同时满足
+    # 「群在 GROUP_WHITELIST」**且**「发送者在 SENDER_WHITELIST」的消息，
+    # 其余的在**写库之前**就被丢掉（群里不进后端、库里不留痕）。
+    #
+    # 为什么默认关死：这套东西只该处理你明确列出来的官方通知群和发布者。
+    # 空名单放开等于"随便哪个群、群里随便谁说话都会入库"，那不是它的用途。
     group_whitelist: str = ""
     sender_whitelist: str = ""
-    # strict=按名单过滤；off=完全不过滤发送者
+    # strict=只有名单里的发送者算（默认）；
+    # off=**不限制发送者**（这个群里谁发的都算）—— 显式选择，不是默认行为
     sender_whitelist_mode: Literal["strict", "off"] = "strict"
 
     # ---------------- 抽取 ----------------
     # rule=只跑规则（不调用模型）；llm=只跑模型；both=模型 + 规则交叉判断
     extractor: Literal["llm", "rule", "both"] = "llm"
-    llm_primary_model: str = "deepseek/deepseek-chat"
+
+    # 模型拆成**提供商 + 模型名**两段配：
+    #   提供商决定用哪种协议、默认打到哪个地址（见 app/llm/providers.py）
+    #   模型名原样发给对方，不解析
+    # 两段分开配之后，模型名里带斜杠也不会歧义：
+    #   LLM_PRIMARY_PROVIDER=openrouter
+    #   LLM_PRIMARY_MODEL=anthropic/claude-sonnet-4
+    llm_primary_provider: str = "deepseek"
+    llm_primary_model: str = "deepseek-chat"
+
+    # 想用没内置的端点（自建、中转站、公司内网关）时填这三个，
+    # 提供商名字随便起，只要有 API_BASE 就行：
+    #   LLM_PRIMARY_PROVIDER=myproxy
+    #   LLM_PRIMARY_API_BASE=https://llm.corp.example.com/v1
+    #   LLM_PRIMARY_API_KEY=xxx
+    llm_primary_api_base: str = ""
+    llm_primary_api_key: str = ""
+    # 自定义端点走哪种协议：openai（默认）/ google
+    llm_primary_api_kind: str = ""
+
+    # 次模型：留空 = 关闭交叉验证。四个字段与主模型一一对应。
+    llm_secondary_provider: str = ""
     llm_secondary_model: str = ""
+    llm_secondary_api_base: str = ""
+    llm_secondary_api_key: str = ""
+    llm_secondary_api_kind: str = ""
+
     llm_temperature: float = 0.0
     llm_max_retries: int = 2
     llm_timeout: int = 60
@@ -185,15 +216,43 @@ class Settings(BaseSettings):
         return set(self.group_whitelist_map.keys())
 
     def in_group_whitelist(self, group_id: str | int) -> bool:
-        """群白名单为空时不做限制（方便首次跑通）。"""
+        """群白名单为空时**不处理任何群**（fail-closed）。
+
+        留空放开等于"bot 在它能收到的每个群里都干活"，那不是它的用途 ——
+        官方通知只发在固定几个群，其余的全是噪音。
+        宁可一开始什么都不收（启动日志会 WARNING），也不要静默地全收。
+        """
         if not self.group_whitelist_map:
-            return True
+            return False
         return str(group_id) in self.group_whitelist_map
 
     def in_sender_whitelist(self, sender_id: str | int) -> bool:
-        if self.sender_whitelist_mode == "off" or not self.sender_whitelist_map:
+        """发送者白名单为空时**不处理任何发送者**（fail-closed）。
+
+        群白名单只限制了"在哪个群"。一个群里几百人，谁说话都会被处理 ——
+        官方通知只由固定的几个人发布，所以这里再收一道。
+
+        `sender_whitelist_mode=off` 是**显式**的逃生口：这个群里谁发的都算。
+        默认的 strict 不会因为名单为空而放开。
+        """
+        if self.sender_whitelist_mode == "off":
             return True
+        if not self.sender_whitelist_map:
+            return False
         return str(sender_id) in self.sender_whitelist_map
+
+    @property
+    def whitelist_ready(self) -> bool:
+        """白名单是否配到了"能收到东西"。
+
+        两个都空 = bot 一条消息都不会处理。启动时必须把这件事说清楚，
+        否则表现出来就是"bot 连上了但什么都不干"，很难查。
+        """
+        if not self.group_whitelist_map:
+            return False
+        if self.sender_whitelist_mode == "strict" and not self.sender_whitelist_map:
+            return False
+        return True
 
     @property
     def inbound_token(self) -> str:
@@ -243,10 +302,17 @@ class Settings(BaseSettings):
 
     @property
     def cross_check_enabled(self) -> bool:
-        """次模型配了、而且和主模型不是同一个，才做交叉验证。"""
-        return bool(self.llm_secondary_model.strip()) and (
-            self.llm_secondary_model.strip() != self.llm_primary_model.strip()
-        )
+        """次模型配了、而且和主模型不是同一个，才做交叉验证。
+
+        "同一个"要按**提供商 + 模型名**一起比：换个提供商打同一个模型名，
+        也算不同的模型（不同端点、不同权重），交叉验证照样有意义。
+        """
+        sec = self.llm_secondary_model.strip()
+        if not sec:
+            return False
+        if sec != self.llm_primary_model.strip():
+            return True
+        return self.llm_secondary_provider.strip() != self.llm_primary_provider.strip()
 
 
 @lru_cache(maxsize=1)

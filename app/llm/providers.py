@@ -1,11 +1,12 @@
-"""厂商注册表。
+"""提供商注册表。
 
-每家只需要四个信息：叫什么、说哪种协议、base URL 在哪、API key 读哪个环境变量。
+每家只需要几个信息：叫什么、说哪种协议、默认 base URL 在哪、API key 读哪个环境变量。
 
-**base URL 可以用环境变量覆盖**：`{厂商名大写}_API_BASE`。
-例如想换 DeepSeek 的代理地址，设 `DEEPSEEK_API_BASE` 即可。
-没注册的厂商前缀也不会报错 —— 见 `gateway.resolve()`，只要设了
-`{前缀大写}_API_BASE` 就会当作 OpenAI 兼容端点处理。
+这张表只是**默认值**，三种覆盖方式（都在 target.build_provider 里处理）：
+  - 配置项 `LLM_*_API_BASE` / `LLM_*_API_KEY` / `LLM_*_API_KIND` —— 推荐，一处配完
+  - 环境变量 `{提供商名大写}_API_BASE` —— 沿用旧写法
+  - 提供商名字**不在这张表里** + 给了 `API_BASE` → 按 OpenAI 兼容端点处理
+    （想用 Google 协议就把 `API_KIND` 设成 google）
 """
 
 from __future__ import annotations
@@ -27,6 +28,9 @@ class Provider:
     key_envs: tuple[str, ...] = ()
     requires_key: bool = True
     extra_headers: tuple[tuple[str, str], ...] = field(default=())
+    # 显式指定的 key（来自 LLM_*_API_KEY）。设了它就不再看环境变量 ——
+    # 这是给自建 / 中转端点用的：一个 key 配在这一处，不用去记厂商的变量名。
+    key_override: str = ""
 
     @property
     def base_env(self) -> str:
@@ -36,11 +40,18 @@ class Provider:
         return (os.environ.get(self.base_env) or self.base_url).rstrip("/")
 
     def api_key(self) -> str | None:
+        if self.key_override:
+            return self.key_override
         for env in self.key_envs:
             value = (os.environ.get(env) or "").strip()
             if value:
                 return value
         return None
+
+    @property
+    def needs_env_key(self) -> bool:
+        """是否**必须**从环境变量里拿 key。显式给了 key 就不必。"""
+        return self.requires_key and not self.key_override
 
 
 GOOGLE_BASE = "https://generativelanguage.googleapis.com/v1beta"

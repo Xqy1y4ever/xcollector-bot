@@ -153,26 +153,66 @@ WARNING OneBot 连接失败（1s 后重试）: ConnectionClosedOK: received 1005
 连接断开后 bot 会自动重连：**稳定运行过一段时间再断开**（NapCat 重启、网络抖动）
 是 1 秒后立刻重连；**连上就被踢**（多半是上面的配置问题）才会逐步退避到最多 60 秒。
 
-## 大模型配置
+## 群与发送者白名单
 
-模型名写成 `厂商/模型名`，网关自动按前缀选择协议，不需要装任何 SDK：
+**两个都是白名单，留空 = 谁都不放行。** bot 只处理同时满足「群在
+`GROUP_WHITELIST`」**且**「发送者在 `SENDER_WHITELIST`」的消息，其余的在
+**写库之前**就被丢掉 —— 群里不进后端，库里也不留痕。
 
 ```env
-LLM_PRIMARY_MODEL=deepseek/deepseek-chat        # DeepSeek（OpenAI 格式）
-LLM_PRIMARY_MODEL=google/gemini-2.5-flash       # Gemini（Google 原生格式）
-LLM_PRIMARY_MODEL=openrouter/anthropic/claude-sonnet-4
-LLM_PRIMARY_MODEL=myproxy/qwen3-32b             # 自建 / 公司内网关
+# 格式都是 id:备注,id:备注（备注可省略）
+GROUP_WHITELIST=123456789:官方通知群,987654321:教务处通知
+SENDER_WHITELIST=10001:张老师,10002:李老师
+# strict=只有名单里的发送者算（默认）
+# off=这个群里谁发的都算（显式选择）
+SENDER_WHITELIST_MODE=strict
 ```
 
-按模型前缀配对应的 API key，例如 `deepseek/...` 配 `DEEPSEEK_API_KEY`、
-`google/...` 配 `GEMINI_API_KEY`。完整清单见 `.env.example`。
+三层过滤，越靠前越省：
 
-- **换服务地址**：`{厂商名大写}_API_BASE`，例如
-  `DEEPSEEK_API_BASE=https://proxy.example.com/v1`，用于走代理或私有部署。
-- **接自建服务**：只要配上 `{前缀大写}_API_BASE`，任何没用过的前缀都会按
-  OpenAI 兼容端点处理。
-- **交叉验证**：`LLM_SECONDARY_MODEL` 填另一个厂商的模型，两个模型给出的
-  截止时间不一致时会降低置信度并标出冲突，由人工确认。
+| 判断 | 不在名单时 | 代价 |
+|---|---|---|
+| 群 | `group_filtered` | 一个后端请求都不发 |
+| 发送者 | `skipped_whitelist` | 原文入库留档，但不抽取、不建条 |
+| 噪声（闲聊） | `noise` | 原文入库，标记为噪声，不计入盲区 |
+
+发送者不在名单时**原文仍然入库**是刻意的：万一名单配漏了，消息还在，之后
+可以补处理；反过来直接丢弃就永久丢了。
+
+白名单没配好时，启动日志会明确警告「会忽略所有消息」—— 否则表现出来只是
+「bot 连上了但什么都不干」，很容易被当成连不上 NapCat 去查错方向。
+
+## 大模型配置
+
+模型拆成**提供商 + 模型名**两段配：提供商决定用哪种协议、默认打到哪个地址，
+模型名原样发给对方。
+
+```env
+LLM_PRIMARY_PROVIDER=deepseek
+LLM_PRIMARY_MODEL=deepseek-chat
+```
+
+内置的提供商见 `app/llm/providers.py`（deepseek / google / openai / openrouter /
+groq / moonshot / zhipu / dashscope / siliconflow / ollama / vllm 等）。按提供商
+配对应的 API key，例如 `deepseek` 配 `DEEPSEEK_API_KEY`、`google` 配
+`GEMINI_API_KEY`。
+
+两段分开的好处：模型名本身带斜杠也不会歧义 ——
+`PROVIDER=openrouter` + `MODEL=anthropic/claude-sonnet-4`。
+
+**想用哪个端点都可以**，填这三个就能接没内置的服务（自建、中转站、公司内网关）：
+
+```env
+LLM_PRIMARY_PROVIDER=myproxy
+LLM_PRIMARY_API_BASE=https://llm.corp.example.com/v1
+LLM_PRIMARY_API_KEY=xxx
+# 可选：自定义端点走哪种协议，openai（默认）/ google
+LLM_PRIMARY_API_KIND=
+```
+
+- **只想换个地址**（走代理、私有部署）而仍用内置提供商：只填 `LLM_PRIMARY_API_BASE` 即可。
+- **交叉验证**：`LLM_SECONDARY_*` 四个字段与主模型一一对应，填了就启用。
+  换个提供商打同一个模型名也算不同的模型，交叉验证照样有意义。
 
 `EXTRACTOR=rule` 时完全不调用模型，只用规则抽取 —— 不需要 API key，
 可以先这样把整条链路跑通再接入大模型。
@@ -181,6 +221,8 @@ LLM_PRIMARY_MODEL=myproxy/qwen3-32b             # 自建 / 公司内网关
 
 ```powershell
 .\.venv\Scripts\python.exe -m app.tools.check_llm
+# 临时验证别的端点，不动配置
+.\.venv\Scripts\python.exe -m app.tools.check_llm --provider google --model gemini-2.5-flash
 ```
 
 ## 私聊指令
@@ -233,11 +275,16 @@ bot 对前端暴露这些接口，都带 `Authorization: Bearer <令牌>`：
 | `WEB_API_TOKEN` | 空 | **网页令牌**，给前端登录页 |
 | `BOT_API_TOKEN` | 空 | 想给 bot 单独一个管理令牌时填；留空用 `API_TOKEN` |
 | `BACKEND_BASE_URL` | `http://127.0.0.1:8000` | 后端地址 |
-| `GROUP_WHITELIST` | 空 | 要处理的群；留空 = 所有群 |
-| `SENDER_WHITELIST` | 空 | 只抽取名单内发送者的消息；留空 = 不限制 |
+| `GROUP_WHITELIST` | 空 | 要处理的群；**留空 = 一个群都不处理** |
+| `SENDER_WHITELIST` | 空 | 要处理的发送者；**留空 = 一个发送者都不处理** |
+| `SENDER_WHITELIST_MODE` | `strict` | `off` = 白名单群内不限发送者（显式放开） |
 | `EXTRACTOR` | `llm` | `rule` / `llm` / `both` |
-| `LLM_PRIMARY_MODEL` | `deepseek/deepseek-chat` | 主模型 |
-| `LLM_SECONDARY_MODEL` | 空 | 交叉验证用的第二个模型 |
+| `LLM_PRIMARY_PROVIDER` | `deepseek` | 主模型提供商（决定协议与默认地址） |
+| `LLM_PRIMARY_MODEL` | `deepseek-chat` | 主模型名 |
+| `LLM_PRIMARY_API_BASE` / `_API_KEY` | 空 | 覆盖提供商的地址 / 密钥（接自建端点用） |
+| `LLM_PRIMARY_API_KIND` | 空 | 自定义端点的协议：`openai` / `google` |
+| `LLM_SECONDARY_PROVIDER` / `_MODEL` | 空 | 交叉验证用的第二个模型；留空 = 关闭 |
+| `LLM_SECONDARY_API_BASE` / `_API_KEY` / `_API_KIND` | 空 | 同上，作用于次模型 |
 | `VLM_ENABLED` | `false` | 让模型一并识别图片里的截止时间 |
 | `DIGEST_ENABLED` / `DIGEST_TIME` | `true` / `21:30` | 每日摘要开关与推送时刻 |
 | `DIGEST_TARGET_QQ` | 空 | 摘要推送给谁（私聊） |

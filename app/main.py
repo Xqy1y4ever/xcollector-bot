@@ -29,6 +29,7 @@ from pydantic import BaseModel, field_validator
 
 from . import __version__
 from .auth import Scope, require_token, require_write
+from .llm.target import target_from_settings
 from .backend_client import BackendClient, BackendError
 from .commands import CommandRouter
 from .config import Settings, get_settings
@@ -334,14 +335,28 @@ class BotRuntime:
         logger.info(
             "群白名单：%s",
             ", ".join(f"{v}({k})" for k, v in settings.group_whitelist_map.items())
-            or "（为空：所有群都收）",
+            or "**为空 —— 一个群都不会处理**",
         )
         logger.info(
             "发送者白名单：mode=%s %s",
             settings.sender_whitelist_mode,
-            ", ".join(f"{v}({k})" for k, v in settings.sender_whitelist_map.items()) or "（为空）",
+            ", ".join(f"{v}({k})" for k, v in settings.sender_whitelist_map.items())
+            or ("（mode=off：不限发送者）" if settings.sender_whitelist_mode == "off"
+                else "**为空 —— 一个发送者都不会处理**"),
         )
-        logger.info("抽取器=%s（主模型=%s）", settings.extractor, settings.llm_primary_model)
+        if not settings.whitelist_ready:
+            # 这条必须显眼：白名单是 fail-closed 的，没配好 = bot 连上了但什么都不干，
+            # 表现出来只是"收不到消息"，很容易被当成连不上 NapCat 去查错方向。
+            logger.warning(
+                "白名单没配好：bot 会**忽略所有消息**。请在 .env 里设置 "
+                "GROUP_WHITELIST（要处理的群）和 SENDER_WHITELIST（发布通知的人），"
+                "格式 id:名称,id:名称。只想先跑通可以临时把 SENDER_WHITELIST_MODE 设成 off。"
+            )
+
+        primary = target_from_settings(settings, "primary")
+        logger.info("抽取器=%s（主模型=%s）", settings.extractor, primary.describe())
+        if settings.cross_check_enabled:
+            logger.info("交叉验证模型=%s", target_from_settings(settings, "secondary").describe())
         logger.info("后端地址：%s", settings.backend_base)
 
         # OneBot 的**生效值**（token 只报有没有，不报内容）。
@@ -542,8 +557,12 @@ class BotRuntime:
             "onebot": self.hub.status(),
             "llm": {
                 "extractor": settings.extractor,
-                "primary_model": settings.llm_primary_model,
-                "secondary_model": settings.llm_secondary_model or None,
+                "primary_model": target_from_settings(settings, "primary").label,
+                "secondary_model": (
+                    target_from_settings(settings, "secondary").label
+                    if settings.cross_check_enabled
+                    else None
+                ),
                 "cross_check_enabled": settings.cross_check_enabled,
                 "vlm_enabled": settings.vlm_enabled,
             },
@@ -557,6 +576,8 @@ class BotRuntime:
                     for sid, name in settings.sender_whitelist_map.items()
                 ],
                 "sender_mode": settings.sender_whitelist_mode,
+                # 白名单是否配到了"能收到东西"。前端可以据此提示"当前不会处理任何消息"。
+                "ready": settings.whitelist_ready,
             },
             "pipeline": {
                 "today_ingested": int(stat.get("ingested") or 0),

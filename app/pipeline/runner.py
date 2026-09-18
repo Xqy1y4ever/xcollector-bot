@@ -46,6 +46,7 @@ import httpx
 
 from ..backend_client import BackendClient, BackendError
 from ..config import Settings, get_settings
+from ..llm.target import target_from_settings
 from ..normalize import attachments_payload
 from ..onebot.segments import parse_message
 from ..utils import local_day, now_ms
@@ -344,7 +345,7 @@ async def parse_content(
 
     tokens = int(out.get("tokens") or 0)
     result = _merge_rule_disagreement(
-        out.get("result"), rule_result, settings.llm_primary_model
+        out.get("result"), rule_result, target_from_settings(settings, "primary").label
     )
     return result, False, tokens
 

@@ -127,8 +127,10 @@ def make_settings(port: int, **overrides) -> Settings:
         extractor="rule",
         media_download_enabled=True,
         vlm_enabled=False,
-        group_whitelist="",
-        sender_whitelist="",
+        # 白名单是 **fail-closed** 的：留空 = 什么都不处理。
+        # 所以夹具里必须把测试用的群和发送者列进去，否则整条链路从第一步就断。
+        group_whitelist="123456789:示例通知群",
+        sender_whitelist="10001:张老师",
         sender_whitelist_mode="strict",
         onebot_ws_url="ws://127.0.0.1:3999",
         command_whitelist="10001:我",
@@ -390,6 +392,52 @@ async def test_group_message_flow(port: int) -> None:
 
 async def test_filters(port: int) -> None:
     print("\n=== 2. 白名单 / 噪声 ===")
+
+    # 白名单**留空 = 什么都不处理**（fail-closed）。
+    # 这是刻意的：官方通知只发在固定几个群、由固定几个人发，
+    # 留空放开等于"随便哪个群、谁说话都入库"。
+    settings_empty = make_settings(port, group_whitelist="", sender_whitelist="")
+    backend_empty = BackendClient(settings_empty)
+    mk = reset_state()
+    msg = await norm(group_event(text="大家下周三前交军训心得"), settings_empty)
+    outcome = await ingest_message(msg, backend_empty, settings=settings_empty)
+    check("群白名单留空 → 不处理任何群", outcome, "group_filtered")
+    check("群白名单留空 → 连后端都不写", sequence_since(mk), [])
+    check_true("群白名单留空 → 库里没有原文", fake_backend.STATE.messages == {})
+    check_true(
+        "群白名单留空 → whitelist_ready 为假（启动会 WARNING）",
+        not settings_empty.whitelist_ready,
+    )
+    await backend_empty.close()
+
+    # 群配了但发送者白名单留空（strict）→ 原文入库，但不抽取
+    settings_nosender = make_settings(port, sender_whitelist="")
+    backend_ns = BackendClient(settings_nosender)
+    reset_state()
+    outcome = await ingest_message(
+        await norm(group_event(message_id=221, text="大家下周三前交军训心得"), settings_nosender),
+        backend_ns,
+        settings=settings_nosender,
+    )
+    check("发送者白名单留空（strict）→ skipped_whitelist", outcome, "skipped_whitelist")
+    check_true(
+        "发送者白名单留空 → whitelist_ready 为假",
+        not settings_nosender.whitelist_ready,
+    )
+    await backend_ns.close()
+
+    # 同一份配置，只把 mode 改成 off（显式放开）→ 就该正常抽取
+    settings_off = make_settings(port, sender_whitelist="", sender_whitelist_mode="off")
+    backend_off = BackendClient(settings_off)
+    reset_state()
+    outcome = await ingest_message(
+        await norm(group_event(message_id=223, text="大家下周三前交军训心得"), settings_off),
+        backend_off,
+        settings=settings_off,
+    )
+    check("mode=off 且发送者白名单留空 → extracted（显式放开）", outcome, "extracted")
+    check_true("mode=off 时 whitelist_ready 为真", settings_off.whitelist_ready)
+    await backend_off.close()
 
     # 群不在白名单 → 一个后端请求都不发
     settings = make_settings(port, group_whitelist="111111:别的群")

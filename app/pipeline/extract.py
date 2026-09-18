@@ -17,6 +17,7 @@ from typing import Any
 from pydantic import BaseModel, Field, ValidationError
 
 from ..config import get_settings
+from ..llm.target import LLMTarget, target_from_settings
 from ..utils import iso_local, now_ms, parse_iso_to_ms, to_local
 
 logger = logging.getLogger(__name__)
@@ -108,7 +109,7 @@ def _build_user_content(raw: dict, images: list[str]) -> Any:
 
 
 async def _call_model(
-    model: str,
+    target: LLMTarget,
     raw: dict,
     images: list[str],
     *,
@@ -130,7 +131,7 @@ async def _call_model(
     ]
 
     result = await acompletion(
-        model=model,
+        target=target,
         messages=messages,
         temperature=settings.llm_temperature,
         timeout=settings.llm_timeout,
@@ -140,7 +141,7 @@ async def _call_model(
     return LLMNotification(**data), result.total_tokens
 
 
-async def run_llm(raw: dict, images: list[str], model: str) -> tuple[LLMNotification, int]:
+async def run_llm(raw: dict, images: list[str], target: LLMTarget) -> tuple[LLMNotification, int]:
     """带重试的模型调用。
 
     第一次用 JSON 模式；若厂商不支持 response_format 会抛错，则退回普通模式再试。
@@ -153,7 +154,7 @@ async def run_llm(raw: dict, images: list[str], model: str) -> tuple[LLMNotifica
         use_json_mode = i == 0
         try:
             return await asyncio.wait_for(
-                _call_model(model, raw, images, use_json_mode=use_json_mode),
+                _call_model(target, raw, images, use_json_mode=use_json_mode),
                 timeout=settings.llm_timeout + 10,
             )
         except ValidationError as exc:
@@ -258,26 +259,35 @@ def cross_check(primary: dict, secondary: dict, secondary_model: str) -> None:
         )
 
 
-async def extract_with_llm(raw: dict, images: list[str]) -> dict:
-    """跑主模型 +（可选）次模型。抛出异常表示 LLM 这条路整体失败。"""
+async def extract_with_llm(
+    raw: dict, images: list[str], *, target: LLMTarget | None = None
+) -> dict:
+    """跑主模型 +（可选）次模型。抛出异常表示 LLM 这条路整体失败。
+
+    `target` 传了就用它当主模型（自检工具用来临时验证别的端点），
+    不传则读配置。
+    """
     settings = get_settings()
-    primary, tokens_p = await run_llm(raw, images, settings.llm_primary_model)
-    result = finalize(primary, raw, settings.llm_primary_model, tokens=tokens_p)
+    primary_target = target or target_from_settings(settings, "primary")
+    secondary_target = target_from_settings(settings, "secondary")
+
+    primary, tokens_p = await run_llm(raw, images, primary_target)
+    result = finalize(primary, raw, primary_target.label, tokens=tokens_p)
 
     if result is None:
         return {"result": None, "tokens": tokens_p}
 
-    if settings.cross_check_enabled:
+    if settings.cross_check_enabled and target is None:
         try:
-            secondary, tokens_s = await run_llm(raw, images, settings.llm_secondary_model)
+            secondary, tokens_s = await run_llm(raw, images, secondary_target)
             tokens_p += tokens_s
-            sec = finalize(secondary, raw, settings.llm_secondary_model, tokens=tokens_s)
+            sec = finalize(secondary, raw, secondary_target.label, tokens=tokens_s)
             if sec is not None:
-                cross_check(result, sec, settings.llm_secondary_model)
+                cross_check(result, sec, secondary_target.label)
             else:
                 result["conflict"] = True
                 result["candidates"].append(
-                    {"model": settings.llm_secondary_model, "due_at": None, "due_text": None}
+                    {"model": secondary_target.label, "due_at": None, "due_text": None}
                 )
                 result["due_confidence"] = min(result["due_confidence"], 0.5)
         except Exception as exc:
@@ -285,7 +295,7 @@ async def extract_with_llm(raw: dict, images: list[str]) -> dict:
             logger.warning("交叉验证模型失败：%s", exc)
             result["candidates"].append(
                 {
-                    "model": settings.llm_secondary_model,
+                    "model": secondary_target.label,
                     "due_at": None,
                     "due_text": None,
                     "error": str(exc)[:200],

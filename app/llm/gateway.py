@@ -28,6 +28,7 @@ import httpx
 
 from .errors import LLMConfigError, LLMError
 from .providers import PROVIDERS, Provider
+from .target import LLMTarget, build_provider
 
 logger = logging.getLogger(__name__)
 
@@ -85,53 +86,16 @@ class LLMResult:
 
 
 # --------------------------------------------------------------------------
-# 模型名解析
+# 端点解析
 # --------------------------------------------------------------------------
-
-def resolve(model: str) -> tuple[Provider, str]:
-    """把 `厂商/模型名` 拆成 (Provider, 真正的模型名)。
-
-    没写前缀 → 当作 openai。前缀没注册但设了 `{前缀}_API_BASE`
-    → 当作自定义的 OpenAI 兼容端点（这样用户可以接任何自建服务，
-    不需要改这个文件）。
-    """
-    raw = (model or "").strip()
-    if not raw:
-        raise LLMConfigError("模型名不能为空，应形如 deepseek/deepseek-chat")
-
-    if "/" in raw:
-        prefix, rest = raw.split("/", 1)
-    else:
-        prefix, rest = "openai", raw
-
-    prefix = prefix.strip().lower()
-    rest = rest.strip()
-    if not rest:
-        raise LLMConfigError(f"模型名不完整：{model!r}")
-
-    provider = PROVIDERS.get(prefix)
-    if provider is None:
-        base_env = f"{prefix.upper().replace('-', '_')}_API_BASE"
-        base = (os.environ.get(base_env) or "").strip()
-        if not base:
-            known = ", ".join(sorted(PROVIDERS))
-            raise LLMConfigError(
-                f"未知的模型厂商前缀 {prefix!r}。已内置：{known}。"
-                f"如果这是自建的 OpenAI 兼容服务，请设环境变量 {base_env}。"
-            )
-        provider = Provider(
-            prefix, "openai", base, (f"{prefix.upper().replace('-', '_')}_API_KEY",),
-            requires_key=False,
-        )
-    return provider, rest
-
 
 def _api_key(provider: Provider) -> str | None:
     key = provider.api_key()
-    if key is None and provider.requires_key:
+    if key is None and provider.needs_env_key:
         wanted = " 或 ".join(provider.key_envs) or "(未配置环境变量名)"
         raise LLMConfigError(
-            f"厂商 {provider.name!r} 缺少 API key，请设置环境变量：{wanted}"
+            f"提供商 {provider.name!r} 缺少 API key。可以设置环境变量：{wanted}；"
+            f"或直接在 LLM_*_API_KEY 里显式指定。"
         )
     return key
 
@@ -142,7 +106,7 @@ def _api_key(provider: Provider) -> str | None:
 
 async def acompletion(
     *,
-    model: str,
+    target: LLMTarget,
     messages: list[dict[str, Any]],
     temperature: float = 0.0,
     timeout: float = 60.0,
@@ -150,7 +114,7 @@ async def acompletion(
     max_tokens: int | None = None,
     json_mode: bool | None = None,
 ) -> LLMResult:
-    """调一次模型。
+    """按 `target`（提供商 + 模型名 + 可选覆盖）调一次模型。
 
     `response_format={"type": "json_object"}` 在 OpenAI 侧原样透传，
     在 Google 侧翻译成 `generationConfig.responseMimeType=application/json`。
@@ -161,23 +125,34 @@ async def acompletion(
     if json_mode is not None and response_format is None:
         response_format = {"type": "json_object"} if json_mode else None
 
-    provider, model_name = resolve(model)
+    if not target.is_configured:
+        raise LLMConfigError(
+            "模型没有配置完整：需要「提供商 + 模型名」两项"
+            "（LLM_PRIMARY_PROVIDER / LLM_PRIMARY_MODEL）。"
+        )
+
+    provider = build_provider(
+        target.provider,
+        api_base=target.api_base,
+        api_key=target.api_key,
+        api_kind=target.api_kind,
+    )
     key = _api_key(provider)
     url, headers, body = _build_request(
-        provider, model_name, key, messages, temperature, response_format, max_tokens
+        provider, target.model, key, messages, temperature, response_format, max_tokens
     )
 
     try:
         resp = await _client().post(url, headers=headers, json=body, timeout=timeout)
     except httpx.TimeoutException as exc:
         raise LLMError(
-            f"调用 {provider.name} 超时（{timeout}s，model={model_name}）",
-            provider=provider.name, model=model_name,
+            f"调用 {provider.name} 超时（{timeout}s，model={target.model}）",
+            provider=provider.name, model=target.model,
         ) from exc
     except httpx.HTTPError as exc:
         raise LLMError(
             f"连接 {provider.name} 失败：{exc}",
-            provider=provider.name, model=model_name,
+            provider=provider.name, model=target.model,
         ) from exc
 
     if resp.status_code >= 400:
@@ -193,7 +168,7 @@ async def acompletion(
             hint = "（模型名或 base URL 不对）"
         raise LLMError(
             f"{provider.name} 返回 HTTP {resp.status_code}{hint}：{snippet}",
-            provider=provider.name, model=model_name,
+            provider=provider.name, model=target.model,
             status=resp.status_code, body=snippet,
         )
 
@@ -202,12 +177,12 @@ async def acompletion(
     except (json.JSONDecodeError, ValueError) as exc:
         raise LLMError(
             f"{provider.name} 返回的不是 JSON（前 200 字）：{resp.text[:200]}",
-            provider=provider.name, model=model_name, status=resp.status_code,
+            provider=provider.name, model=target.model, status=resp.status_code,
         ) from exc
 
     if provider.kind == "google":
-        return _parse_google(data, provider, model_name)
-    return _parse_openai(data, provider, model_name)
+        return _parse_google(data, provider, target.model)
+    return _parse_openai(data, provider, target.model)
 
 
 # --------------------------------------------------------------------------

@@ -20,7 +20,8 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from app.llm import LLMConfigError, LLMError, acompletion, resolve
+from app.llm import LLMConfigError, LLMError, LLMTarget, acompletion, build_provider
+from app.llm.target import target_from_settings
 from app.llm.providers import PROVIDERS
 
 # --------------------------------------------------------------------------
@@ -143,53 +144,118 @@ def google_response(text: str = '{"ok":true}') -> dict:
 # 用例
 # --------------------------------------------------------------------------
 
-def test_resolve() -> None:
-    p, m = resolve("deepseek/deepseek-chat")
-    eq(p.name, "deepseek", "resolve: 厂商前缀")
-    eq(p.kind, "openai", "resolve: deepseek 走 openai 协议")
-    eq(m, "deepseek-chat", "resolve: 模型名")
+def test_build_provider() -> None:
+    """提供商解析 + 显式覆盖（base / key / 协议）。"""
+    p = build_provider("deepseek")
+    eq(p.name, "deepseek", "provider: 名字")
+    eq(p.kind, "openai", "provider: deepseek 走 openai 协议")
 
-    p, m = resolve("google/gemini-2.5-flash")
-    eq(p.kind, "google", "resolve: google 走 google 协议")
-    eq(m, "gemini-2.5-flash", "resolve: google 模型名")
+    p = build_provider("GOOGLE")  # 大小写不敏感
+    eq(p.kind, "google", "provider: google 走 google 协议")
 
-    p, m = resolve("gemini/gemini-2.5-pro")
-    eq(p.name, "google", "resolve: gemini 是 google 的别名")
-    eq(m, "gemini-2.5-pro", "resolve: gemini 别名模型名")
+    p = build_provider("gemini")
+    eq(p.name, "google", "provider: gemini 是 google 的别名")
+    eq(p.kind, "google", "provider: 别名也用 google 协议")
 
-    # 模型名本身带斜杠：只有第一段是厂商
-    p, m = resolve("openrouter/anthropic/claude-sonnet-4")
-    eq(p.name, "openrouter", "resolve: 多段斜杠取第一段当厂商")
-    eq(m, "anthropic/claude-sonnet-4", "resolve: 多段斜杠其余全是模型名")
-
-    # 无前缀 → openai
-    p, m = resolve("gpt-4o-mini")
-    eq(p.name, "openai", "resolve: 无前缀按 openai")
-    eq(m, "gpt-4o-mini", "resolve: 无前缀模型名")
-
-    # 空模型名要报配置错误
-    for bad in ("", "   ", "deepseek/"):
+    # 空名字要报配置错误，并说清楚该配什么
+    for bad in ("", "   "):
         try:
-            resolve(bad)
-            check(False, f"resolve: {bad!r} 应当报错")
-        except LLMConfigError:
-            check(True, f"resolve: {bad!r} 报 LLMConfigError")
+            build_provider(bad)
+            check(False, f"provider: {bad!r} 应当报错")
+        except LLMConfigError as exc:
+            check("LLM_PRIMARY_PROVIDER" in str(exc), f"provider: {bad!r} 的报错给出该配哪一项", str(exc))
 
-    # 未知前缀且没配 base → 明确报错，并提示该设哪个变量
-    os.environ.pop("MYSTERY_API_BASE", None)
+    # 未知提供商且没给 base → 明确报错，并告诉他自建端点该填什么
     try:
-        resolve("mystery/some-model")
-        check(False, "resolve: 未知厂商应当报错")
+        build_provider("mystery")
+        check(False, "provider: 未知提供商且无 base 应当报错")
     except LLMConfigError as exc:
-        check("MYSTERY_API_BASE" in str(exc), "resolve: 未知厂商报错里给出要设的环境变量", str(exc))
+        check("API_BASE" in str(exc), "provider: 未知提供商的报错里提到 API_BASE", str(exc))
 
-    # 未知前缀但配了 base → 当作自定义 OpenAI 兼容端点
-    os.environ["MYSTERY_API_BASE"] = "http://127.0.0.1:1/v1"
-    p, m = resolve("mystery/some-model")
-    eq(p.kind, "openai", "resolve: 自建端点按 openai 协议")
-    eq(p.resolved_base_url(), "http://127.0.0.1:1/v1", "resolve: 自建端点 base 来自环境变量")
-    check(not p.requires_key, "resolve: 自建端点不强制要 key")
-    os.environ.pop("MYSTERY_API_BASE", None)
+    # 未知提供商 + base → 按 OpenAI 兼容端点处理，且不强制要 key
+    p = build_provider("mystery", api_base="http://127.0.0.1:1/v1")
+    eq(p.kind, "openai", "provider: 自建端点默认按 openai 协议")
+    eq(p.resolved_base_url(), "http://127.0.0.1:1/v1", "provider: 自建端点用给定的 base")
+    check(not p.requires_key, "provider: 自建端点不强制要 key")
+
+    # 未知提供商 + base + kind=google → 走 Google 原生协议（想用哪个端点都可以）
+    p = build_provider("mygemini", api_base="http://127.0.0.1:2/v1beta", api_kind="google")
+    eq(p.kind, "google", "provider: 自建端点可以指定 google 协议")
+
+    # 非法协议要报错，不能静默按 openai 处理
+    try:
+        build_provider("mystery", api_base="http://x/v1", api_kind="anthropic")
+        check(False, "provider: 非法 API_KIND 应当报错")
+    except LLMConfigError as exc:
+        check("openai 或 google" in str(exc), "provider: 非法 API_KIND 的报错说明合法取值", str(exc))
+
+    # 内置提供商也能被覆盖 base / key
+    p = build_provider("openai", api_base="http://proxy.example.com/v1")
+    eq(p.resolved_base_url(), "http://proxy.example.com/v1", "provider: 内置厂商的 base 可覆盖")
+    eq(p.key_envs, PROVIDERS["openai"].key_envs, "provider: 覆盖 base 不影响 key 变量名")
+
+    p = build_provider("openai", api_key="sk-explicit")
+    eq(p.api_key(), "sk-explicit", "provider: 显式 key 生效")
+    check(not p.needs_env_key, "provider: 给了显式 key 就不再要求环境变量")
+
+
+def test_target_from_settings() -> None:
+    """配置 → 调用目标，含旧写法的兼容。"""
+    from app.config import Settings
+
+    s = Settings(
+        llm_primary_provider="openrouter",
+        llm_primary_model="anthropic/claude-sonnet-4",
+    )
+    t = target_from_settings(s, "primary")
+    eq(t.provider, "openrouter", "target: 提供商")
+    # 关键：模型名里带斜杠**不能**被当成"又写了一遍提供商"
+    eq(t.model, "anthropic/claude-sonnet-4", "target: 模型名里的斜杠原样保留")
+    eq(t.label, "openrouter/anthropic/claude-sonnet-4", "target: label")
+
+    # 旧写法：模型名前面又写了一遍提供商 → 剥掉，仍然可用
+    s = Settings(llm_primary_provider="deepseek", llm_primary_model="deepseek/deepseek-chat")
+    t = target_from_settings(s, "primary")
+    eq(t.model, "deepseek-chat", "target: 旧写法里重复的提供商前缀被剥掉")
+    eq(t.label, "deepseek/deepseek-chat", "target: label 与旧的单字符串写法一致")
+
+    # 覆盖项透传
+    s = Settings(
+        llm_primary_provider="myproxy",
+        llm_primary_model="qwen3-32b",
+        llm_primary_api_base="https://llm.corp.example.com/v1",
+        llm_primary_api_key="k-123",
+        llm_primary_api_kind="openai",
+    )
+    t = target_from_settings(s, "primary")
+    eq(t.api_base, "https://llm.corp.example.com/v1", "target: api_base 透传")
+    eq(t.api_key, "k-123", "target: api_key 透传")
+    eq(t.api_kind, "openai", "target: api_kind 透传")
+    check(t.is_configured, "target: 配全了")
+    check("k-123" not in t.describe(), "target: describe 不泄露 key", t.describe())
+
+    # 次模型走另一套字段
+    s = Settings(
+        llm_primary_provider="deepseek",
+        llm_primary_model="deepseek-chat",
+        llm_secondary_provider="google",
+        llm_secondary_model="gemini-2.5-flash",
+    )
+    eq(target_from_settings(s, "secondary").provider, "google", "target: 次模型用 secondary 字段")
+    check(s.cross_check_enabled, "target: 次模型配了就开交叉验证")
+
+    # 只差提供商也算不同模型
+    s = Settings(
+        llm_primary_provider="deepseek",
+        llm_primary_model="deepseek-chat",
+        llm_secondary_provider="openrouter",
+        llm_secondary_model="deepseek-chat",
+    )
+    check(s.cross_check_enabled, "target: 提供商不同也算不同模型，交叉验证仍然有意义")
+
+    # 完全没配 / 模型名为空 → is_configured 为假，调用时报明确错误
+    s = Settings(llm_primary_provider="", llm_primary_model="")
+    check(not target_from_settings(s, "primary").is_configured, "target: 空配置识别为未配置")
 
 
 def test_missing_key() -> None:
@@ -197,7 +263,7 @@ def test_missing_key() -> None:
         os.environ.pop(env, None)
     try:
         asyncio.run(
-            acompletion(model="openai/gpt-4o-mini", messages=[{"role": "user", "content": "hi"}])
+            acompletion(target=LLMTarget(provider="openai", model="gpt-4o-mini"), messages=[{"role": "user", "content": "hi"}])
         )
         check(False, "缺 key 应当报 LLMConfigError")
     except LLMConfigError as exc:
@@ -215,7 +281,7 @@ def test_openai_wire(base: str) -> None:
 
     result = asyncio.run(
         acompletion(
-            model="openai/deepseek-chat",
+            target=LLMTarget(provider="openai", model="deepseek-chat"),
             messages=[
                 {"role": "system", "content": "你是抽取助手"},
                 {"role": "user", "content": "明天中午12点前交表"},
@@ -255,7 +321,7 @@ def test_openai_image_passthrough(base: str) -> None:
     data_url = "data:image/png;base64,QUJD"
     asyncio.run(
         acompletion(
-            model="openai/gpt-4o-mini",
+            target=LLMTarget(provider="openai", model="gpt-4o-mini"),
             messages=[
                 {
                     "role": "user",
@@ -282,7 +348,7 @@ def test_google_wire(base: str) -> None:
     data_url = "data:image/jpeg;base64,QUJD"
     result = asyncio.run(
         acompletion(
-            model="google/gemini-2.5-flash",
+            target=LLMTarget(provider="google", model="gemini-2.5-flash"),
             messages=[
                 {"role": "system", "content": "你是抽取助手"},
                 {"role": "user", "content": "明天中午12点前交表"},
@@ -367,7 +433,7 @@ def test_google_multi_part_text(base: str) -> None:
         },
     )
     result = asyncio.run(
-        acompletion(model="google/gemini-2.5-flash", messages=[{"role": "user", "content": "x"}])
+        acompletion(target=LLMTarget(provider="google", model="gemini-2.5-flash"), messages=[{"role": "user", "content": "x"}])
     )
     eq(result.text, '{"title":"班会"}', "google: 多个 text part 拼接")
     eq(result.total_tokens, 3, "google: 只有 totalTokenCount 时也能取到")
@@ -388,7 +454,7 @@ def test_google_http_image_degrades(base: str) -> None:
     try:
         asyncio.run(
             acompletion(
-                model="google/gemini-2.5-flash",
+                target=LLMTarget(provider="google", model="gemini-2.5-flash"),
                 messages=[
                     {
                         "role": "user",
@@ -428,7 +494,7 @@ def test_no_text_when_blocked(base: str) -> None:
     )
     try:
         asyncio.run(
-            acompletion(model="google/gemini-2.5-flash", messages=[{"role": "user", "content": "x"}])
+            acompletion(target=LLMTarget(provider="google", model="gemini-2.5-flash"), messages=[{"role": "user", "content": "x"}])
         )
         check(False, "google: 被拦截时应当报错")
     except LLMError as exc:
@@ -451,7 +517,7 @@ def test_errors(base: str) -> None:
         _STATE["responder"] = lambda path, s=status, p=payload: (s, p)
         try:
             asyncio.run(
-                acompletion(model="openai/gpt-4o-mini", messages=[{"role": "user", "content": "x"}])
+                acompletion(target=LLMTarget(provider="openai", model="gpt-4o-mini"), messages=[{"role": "user", "content": "x"}])
             )
             check(False, f"HTTP {label} 应当抛 LLMError")
         except LLMError as exc:
@@ -464,7 +530,7 @@ def test_errors(base: str) -> None:
     _STATE["responder"] = lambda path: (200, {"error": {"message": "quota exceeded"}})
     try:
         asyncio.run(
-            acompletion(model="openai/gpt-4o-mini", messages=[{"role": "user", "content": "x"}])
+            acompletion(target=LLMTarget(provider="openai", model="gpt-4o-mini"), messages=[{"role": "user", "content": "x"}])
         )
         check(False, "200 + body.error 应当报错")
     except LLMError as exc:
@@ -474,7 +540,7 @@ def test_errors(base: str) -> None:
     _STATE["responder"] = lambda path: (200, {"usage": {}})
     try:
         asyncio.run(
-            acompletion(model="openai/gpt-4o-mini", messages=[{"role": "user", "content": "x"}])
+            acompletion(target=LLMTarget(provider="openai", model="gpt-4o-mini"), messages=[{"role": "user", "content": "x"}])
         )
         check(False, "缺 choices 应当报错")
     except LLMError as exc:
@@ -484,7 +550,7 @@ def test_errors(base: str) -> None:
     _STATE["responder"] = lambda path: (200, "<html>502 Bad Gateway</html>")
     try:
         asyncio.run(
-            acompletion(model="openai/gpt-4o-mini", messages=[{"role": "user", "content": "x"}])
+            acompletion(target=LLMTarget(provider="openai", model="gpt-4o-mini"), messages=[{"role": "user", "content": "x"}])
         )
         check(False, "非 JSON 响应应当报错")
     except LLMError as exc:
@@ -498,7 +564,7 @@ def test_timeout(base: str) -> None:
     try:
         asyncio.run(
             acompletion(
-                model="openai/gpt-4o-mini",
+                target=LLMTarget(provider="openai", model="gpt-4o-mini"),
                 messages=[{"role": "user", "content": "x"}],
                 timeout=1.0,
             )
@@ -518,7 +584,7 @@ def test_json_mode_shorthand(base: str) -> None:
 
     asyncio.run(
         acompletion(
-            model="openai/gpt-4o-mini",
+            target=LLMTarget(provider="openai", model="gpt-4o-mini"),
             messages=[{"role": "user", "content": "x"}],
             json_mode=True,
         )
@@ -532,7 +598,7 @@ def test_json_mode_shorthand(base: str) -> None:
     _STATE["requests"].clear()
     asyncio.run(
         acompletion(
-            model="openai/gpt-4o-mini",
+            target=LLMTarget(provider="openai", model="gpt-4o-mini"),
             messages=[{"role": "user", "content": "x"}],
             json_mode=False,
         )
@@ -551,7 +617,7 @@ def test_base_url_override(base: str) -> None:
     _STATE["responder"] = lambda path: (200, openai_response("{}"))
 
     asyncio.run(
-        acompletion(model="deepseek/deepseek-chat", messages=[{"role": "user", "content": "x"}])
+        acompletion(target=LLMTarget(provider="deepseek", model="deepseek-chat"), messages=[{"role": "user", "content": "x"}])
     )
     eq(_STATE["requests"][0]["path"], "/custom/v1/chat/completions", "base 覆盖 + 去掉尾部斜杠")
 
@@ -578,7 +644,7 @@ def test_across_event_loops(base: str) -> None:
         results.append(
             asyncio.run(
                 acompletion(
-                    model="openai/gpt-4o-mini",
+                    target=LLMTarget(provider="openai", model="gpt-4o-mini"),
                     messages=[{"role": "user", "content": f"第 {i} 次"}],
                 )
             )
@@ -598,7 +664,8 @@ def main() -> int:
     print(f"假厂商服务已启动：{base}\n")
 
     try:
-        test_resolve()
+        test_build_provider()
+        test_target_from_settings()
         test_missing_key()
         test_openai_wire(base)
         test_openai_image_passthrough(base)
