@@ -344,6 +344,25 @@ class BotRuntime:
         logger.info("抽取器=%s（主模型=%s）", settings.extractor, settings.llm_primary_model)
         logger.info("后端地址：%s", settings.backend_base)
 
+        # OneBot 的**生效值**（token 只报有没有，不报内容）。
+        # 为什么要专门打这一行：部署时最常见的坑是"改了 .env 但容器没重建"——
+        # 容器的环境变量在**创建那一刻**就固定了，`docker compose restart` 不会重读 .env。
+        # 那时这里显示的还是旧地址，一眼就能看出来，不用去猜"是不是程序没读 .env"。
+        if settings.onebot_mode == "client":
+            logger.info(
+                "OneBot：mode=client → 连接 %s（access_token %s）",
+                settings.onebot_ws_url,
+                "已配置" if settings.onebot_access_token else "**未配置**",
+            )
+        else:
+            logger.info(
+                "OneBot：mode=server → 监听 %s:%s%s（access_token %s）",
+                settings.onebot_listen_host,
+                settings.onebot_listen_port,
+                settings.onebot_listen_path,
+                "已配置" if settings.onebot_access_token else "**未配置**",
+            )
+
         if not settings.inbound_token:
             # 这条 WARNING 是刻意留的：/api/send/* 能冒充机器人发言，
             # 忘了配 token 就等于把它暴露给任何能访问这个端口的人。
