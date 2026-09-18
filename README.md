@@ -30,14 +30,18 @@ Xcollector 的**消息处理层**：独占 OneBot(NapCat) 连接，把 QQ 群里
 ### Docker（推荐）
 
 ```bash
-cd xcollector-deploy
+cd xcollector-deploy/bot
 cp .env.example .env
-# 至少改：API_TOKEN、GROUP_WHITELIST、SENDER_WHITELIST、ONEBOT_MODE/ONEBOT_WS_URL
-docker compose up -d bot
+# 至少改：API_TOKEN（与 backend 那边同一个值）、GROUP_WHITELIST、SENDER_WHITELIST、ONEBOT_WS_URL
+./preflight.sh
+./start.sh
 ```
 
-镜像名：`ghcr.io/xqy1y4ever/xcollector-bot:latest`。bot 容器**不需要卷**，
+镜像名：`ghcr.io/xqy1y4ever/xcollector-bot:latest`。bot 容器**没有卷**，
 它不保存任何要跨重启存活的状态，容器随便删。
+
+> 前提是 backend 那个栈已经起过 —— bot 靠它建的 Docker 网络（默认 `xcollector`）
+> 用服务名 `backend` 找到后端。先起 bot 会直接报「找不到网络」并告诉你该去哪个目录。
 
 ### 本地跑
 
@@ -61,7 +65,8 @@ ONEBOT_ACCESS_TOKEN=          # 与 NapCat 里配的 access token 一致；留�
 
 反向模式（NapCat 连 bot）把 `ONEBOT_MODE=server`，并配
 `ONEBOT_LISTEN_HOST/PORT/PATH`。容器里连宿主机上的 NapCat 用
-`ws://host.docker.internal:3001`（compose 已经配好 extra_hosts）。
+`ws://host.docker.internal:3001`（deploy 里的 `start.sh` 已经加了
+`--add-host host.docker.internal:host-gateway`，Linux 上也能用这个名字）。
 
 连不上不会让 bot 崩，只是收不到消息；状态见 `GET /api/status` 或网页的「系统状态」页。
 
