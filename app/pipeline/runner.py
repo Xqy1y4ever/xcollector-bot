@@ -51,7 +51,7 @@ from ..llm.target import target_from_settings
 from ..normalize import attachments_payload
 from ..onebot.segments import parse_message
 from ..utils import local_day, now_ms
-from .extract import extract_with_llm
+from .extract import extract_with_llm, fill_due_from_rule
 from .rule_extract import rule_extract
 from .trace import elapsed_ms, fmt_due, log_message, log_stage, message_meta
 
@@ -70,7 +70,8 @@ MEDIA_TIMEOUT = 20.0
 # 启动 / 重连后最多捡回多少条 pending 消息（契约 GET /api/messages 的 limit 上限是 1000）
 RECOVERY_LIMIT = 200
 
-_media_client: httpx.AsyncClient | None = None
+# 媒体下载的连接池：{是否本机地址: client}（见 `_get_media_client` 的说明）
+_media_clients: dict[bool, httpx.AsyncClient] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -159,23 +160,40 @@ def attachments_from_row(row: Mapping[str, Any]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _get_media_client() -> httpx.AsyncClient:
-    """媒体下载共用一个连接池。
+def _is_local_url(url: str) -> bool:
+    """这个 URL 指向本机吗（127.0.0.1 / localhost / ::1）。"""
+    try:
+        host = (httpx.URL(url).host or "").lower()
+    except Exception:  # noqa: BLE001 - 解析不了就当不是本机（照常走系统代理）
+        return False
+    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
 
-    QQ 的图片 URL 是 HTTPS，每条消息都新建客户端会白白付 TLS 握手；
-    而这个客户端**不碰后端**（后端走 BackendClient），所以生命周期分开是安全的。
+
+def _get_media_client(url: str) -> httpx.AsyncClient:
+    """媒体下载的连接池，**按 URL 分成两个**：本机的那个不走系统代理。
+
+    为什么要分开：`trust_env` 是**客户端级**的选项，而同一个下载函数既要拿公网的
+    QQ CDN 图片、又要拿自检里跑在 `127.0.0.1` 的假 CDN。httpx 默认 `trust_env=True`
+    会读 Windows 注册表里的系统代理（装过 Clash/V2Ray 的机器上常留着一条
+    `127.0.0.1:7890`）：那个代理没开着时，连本机地址都会被发过去然后连接被拒，
+    而公网地址该不该走代理是用户自己的网络环境决定的 —— 别一刀切。
     """
-    global _media_client
-    if _media_client is None or _media_client.is_closed:
-        _media_client = httpx.AsyncClient(timeout=MEDIA_TIMEOUT, follow_redirects=True)
-    return _media_client
+    local = _is_local_url(url)
+    client = _media_clients.get(local)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            timeout=MEDIA_TIMEOUT, follow_redirects=True, trust_env=not local
+        )
+        _media_clients[local] = client
+    return client
 
 
 async def close_media_client() -> None:
-    global _media_client
-    if _media_client is not None and not _media_client.is_closed:
-        await _media_client.aclose()
-    _media_client = None
+    global _media_clients
+    for client in _media_clients.values():
+        if client is not None and not client.is_closed:
+            await client.aclose()
+    _media_clients = {}
 
 
 @dataclass
@@ -208,7 +226,7 @@ def _degraded_attachment(att: Mapping[str, Any], source_url: str | None, note: s
 
 async def _download(url: str, max_bytes: int) -> tuple[bytes | None, str | None, str | None]:
     """下载字节。返回 (内容, content_type, 失败原因)。**不抛异常。**"""
-    client = _get_media_client()
+    client = _get_media_client(url)
     try:
         async with client.stream("GET", url) as resp:
             if resp.status_code != 200:
@@ -300,13 +318,28 @@ async def prepare_attachments(
 def _merge_rule_disagreement(
     llm_result: dict | None, rule_result: dict | None, model: str
 ) -> dict | None:
-    """模型说"不是通知"，但规则认为有明确时间 → 保留条目并标冲突。
+    """模型说"不是通知"、但规则**看到了通知特征 + 一个明确时间** → 保留条目并标冲突。
 
     方向是刻意的：宁可多推一条让人一键否决，也不能漏掉一条真通知。
+
+    两道门槛（v3 起）：
+
+    1. 规则侧只有"时间词"没有"通知词"的消息，`rule_extract` 直接返回 None ——
+       「@张三 明天」「我下周三可能去不了」不会再变成任务；
+    2. 这里**必须有一个解析出来的 due_at** 才反着推。函数名和文档一直写的是
+       "规则认为有**明确时间**"，但代码原来只要求"规则有结果"，于是
+       「刚刚的会议记录我发群里了」这种（命中"会议"、没有任何时间）的历史消息，
+       在模型正确判成闲聊之后又被拉回来当成一条冲突任务。
     """
     if llm_result is not None:
         return llm_result
     if rule_result is None:
+        return None
+    if rule_result.get("due_at") is None:
+        logger.info(
+            "模型判为非通知，规则只命中了通知词、没解析出时间 → 尊重模型，不建条（规则证据：%r）",
+            str(rule_result.get("evidence") or "")[:60],
+        )
         return None
 
     merged = dict(rule_result)
@@ -348,6 +381,9 @@ async def parse_content(
     result = _merge_rule_disagreement(
         out.get("result"), rule_result, target_from_settings(settings, "primary").label
     )
+    # 模型"是通知但没算出时间"时，用确定性的规则引擎补 due_at（「下周三」「这周天」
+    # 这类相对时间靠日期运算，模型经常算不出来，而 parse_due 不会算错）。
+    result = fill_due_from_rule(result, rule_result, source_ts=ts)
     return result, False, tokens
 
 

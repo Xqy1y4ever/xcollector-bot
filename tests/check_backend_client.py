@@ -67,7 +67,7 @@ def check_true(name: str, cond: bool, detail: str = "") -> None:
 
 def register(qq: str) -> tuple[str, str]:
     """直接用 httpx 注册（注册流程本身由后端的测试守，这里只是在造测试数据）。"""
-    c = httpx.Client(timeout=20)
+    c = httpx.Client(timeout=20, trust_env=False)   # 本机假后端不走系统代理
     try:
         code = c.post(f"{API}/verify/request", json={"qq": qq}, headers=H).json()["code"]
         invite = c.post(
@@ -269,6 +269,7 @@ async def main() -> int:
             params={"user_id": uid_a},
             headers=H,
             timeout=20,
+            trust_env=False,   # 同上：本机后端不走系统代理
         )
         check("读修正历史 → 200", history.status_code, 200)
         rows = history.json().get("corrections") or history.json().get("items") or []

@@ -24,6 +24,16 @@ WEEKDAY = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6,
 PAT_FULL = re.compile(r"(\d{4})\s*[-/年.]\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})\s*[日号]?")
 PAT_MD = re.compile(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]")
 PAT_WEEK = re.compile(r"(下下|下|本|这)?\s*(?:周|星期|礼拜)\s*([一二三四五六日天])")
+# 「本周末 / 这周末 / 下周末 / 周末」：和「周X」一样是**日期**（映射到那一周的周日），
+# 但"周末"本身是两天，所以置信度比「周五」低一档（见下面的 0.65 / 0.7）。
+PAT_WEEKEND = re.compile(r"(下下|下|本|这)?\s*(?:周|星期|礼拜)\s*末")
+# 「月底 / 月末 / 本月底 / 下个月底」→ 当月/下月最后一天 23:59
+PAT_MONTH_END = re.compile(r"(下下|下|本|这)?\s*(?:个)?\s*月\s*(?:底|末)")
+# 「本月内 / 下个月内 / 这月之前」→ 同「月底」（都是"这个月结束前"）
+PAT_MONTH_IN = re.compile(r"(下下|下|本|这)\s*(?:个)?\s*月\s*(?:内|之内|以内|之前|以前|前)")
+# 裸「周末」「月底」这类模糊说法：后面**必须**跟一个截止意味的词，
+# 否则"周末一起吃饭"也会被当成截止时间（那是闲聊，不是通知）。
+DEADLINE_TAIL = re.compile(r"前|之前|以前|之内|以内|内|截止")
 PAT_DAY = re.compile(r"(大后天|后天|明天|明晚|今晚|今天)")
 PAT_AFTER = re.compile(r"(\d{1,3})\s*(天|日|小时|周)\s*(?:后|以后|之内|内)")
 
@@ -175,6 +185,20 @@ def _weekday_target(base: datetime, prefix: str, wd: int) -> datetime:
     return target
 
 
+def end_of_month(base: datetime, offset_months: int = 0) -> datetime:
+    """当月（offset=0）或往后第 N 个月的最后一天（**不记闰年**：下月 1 号减一天）。
+
+    抽出来给 `extract.build_calendar()` 用：给模型的相对时间换算表里要写"本月最后一天"，
+    而那必须和 `parse_due("月底前")` 算出**同一天**，否则模型与规则会给出两个答案。
+    """
+    month_index = base.month - 1 + offset_months
+    year = base.year + month_index // 12
+    month = month_index % 12 + 1
+    first = datetime(year, month, 1, tzinfo=base.tzinfo)
+    first_next = first.replace(year=year + 1, month=1) if month == 12 else first.replace(month=month + 1)
+    return first_next - timedelta(days=1)
+
+
 def parse_due(text: str, anchor_ms: int) -> DueGuess | None:
     """从文本里解析截止时间。返回 None 表示没能可靠解析。"""
     if not text:
@@ -230,6 +254,43 @@ def parse_due(text: str, anchor_ms: int) -> DueGuess | None:
             _to_ms(target), _phrase(text, m), sentence_around(text, m.start(), m.end()),
             round(0.7 + bonus, 2),
         )
+
+    # ---- 3b. 本周末 / 下周末 / 周末（→ 那一周的周日）----
+    # 放在「周X」之后：「周末」里的"末"不在周几的字符集里，两者不会互相抢匹配。
+    # 裸「周末」（不带 本/这/下）要求后面跟截止词，否则"周末一起吃饭"会被当截止时间。
+    m = PAT_WEEKEND.search(text)
+    if m:
+        prefix = m.group(1) or ""
+        phrase = _phrase(text, m)
+        if prefix or DEADLINE_TAIL.search(phrase[len(m.group(0)) :] or phrase):
+            target = _weekday_target(base, prefix, 6)   # 6 = 周日
+            hh, mm, bonus = _clock_from(text, m.end(), min(len(text), m.end() + 40))
+            target = target.replace(hour=hh, minute=mm)
+            # "周末"是两天，不如"周五"确定 → 置信度低一档
+            base_conf = 0.7 if prefix else 0.65
+            return DueGuess(
+                _to_ms(target), phrase, sentence_around(text, m.start(), m.end()),
+                round(min(0.85, base_conf + bonus), 2),
+            )
+
+    # ---- 3c. 月底 / 月末 / 本月底 / 下个月底 / 本月内 ----
+    m = PAT_MONTH_END.search(text) or PAT_MONTH_IN.search(text)
+    if m:
+        prefix = m.group(1) or ""
+        phrase = _phrase(text, m)
+        if prefix or DEADLINE_TAIL.search(phrase[len(m.group(0)) :] or phrase):
+            offset = {"下": 1, "下下": 2}.get(prefix, 0)
+            target = end_of_month(base, offset).replace(
+                hour=DEFAULT_CLOCK[0], minute=DEFAULT_CLOCK[1]
+            )
+            hh, mm, bonus = _clock_from(text, m.end(), min(len(text), m.end() + 40))
+            # "月底前"不带具体时刻时用 23:59；带了（"月底18点前"）就听它的
+            if bonus:
+                target = target.replace(hour=hh, minute=mm)
+            return DueGuess(
+                _to_ms(target), phrase, sentence_around(text, m.start(), m.end()),
+                round(0.8 + bonus, 2),
+            )
 
     # ---- 4. 今天/明天/后天 ----
     m = PAT_DAY.search(text)

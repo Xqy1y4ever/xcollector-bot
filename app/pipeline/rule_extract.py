@@ -1,3 +1,11 @@
+# ⚠️ 与 xcollector-client/app/pipeline/rule_extract.py 是**同一份东西**（除了这段说明）。
+#
+# 为什么必须一致：bot 处理 OneBot 的实时消息，client 处理聊天记录库里的历史消息，
+# 两边都要回答"这条像不像通知"和"截止时间是什么"。判据一旦漂移，同一条通知从两条
+# 链路进来会得到两个结果（一条建条、一条当闲聊丢掉），而用户没法知道该信哪个。
+#
+# 改这里之前先想清楚：**另一边的同名文件也要改**。
+
 """确定性规则抽取器。
 
 存在的意义有两个：
@@ -21,11 +29,22 @@ NOISE_EXACT = {
     "已阅", "赞", "👍", "谢谢老板", "老师好", "早上好", "晚安",
 }
 
-# 通知类关键词
+# 通知类关键词 —— 同时也是"这条像不像通知"的**门槛**（见 rule_extract 的说明）：
+# 只有时间词、没有这些词的消息不再建条。
+#
+# ⚠️ v3 把「本周 / 下周 / 之前 / 时间 / 地点」这些**时间与结构词**从词表里拿掉了：
+# 它们是"什么时候/在哪儿"，不是"要做什么"。留着它们等于把门槛又拆了 ——
+# 「我下周三可能去不了」正是靠"下周"混过门槛、被做成任务的。
 NOTICE_KEYWORDS = re.compile(
     r"通知|公告|安排|务必|请|需要|注意|截止|报名|统计|接龙|填表|填写|提交|上交|"
-    r"签到|作业|会议|活动|考试|测试|比赛|缴费|领取|参加|全体|集合|时间|地点|"
-    r"要求|规定|提醒|重要|下学期|本周|下周|之前|完成|准备|材料|清单|公示|名单"
+    r"签到|作业|会议|活动|考试|测试|比赛|缴费|领取|参加|全体|集合|"
+    r"要求|规定|提醒|重要|下学期|完成|准备|材料|清单|公示|名单"
+    # v3 追加：真实语料里高频、而老词表漏掉的"要做的事"（漏掉它们的后果是
+    # 「明天上午9点开会」这种最典型的通知反而不建条）
+    r"|开会|班会|例会|大会|晚会|运动会|宣讲|答疑|讲座|培训|面试|答辩|体检|接种|军训|"
+    r"服装|尺码|报到|登记|注册|激活|预约|报告|论文|作品|照片|电子版|扫描件|表格|"
+    r"办理|申领|缴纳|选课|退课|退选|申请|核对|确认|上传|下载|观看|值班|打扫|清点|"
+    r"归还|发放|签收|签字|签署|补交|退还|宿舍|寝室|校园卡|一卡通|银行卡|回执|问卷"
 )
 
 # 强调词，提升置信度
@@ -89,7 +108,21 @@ def is_noise(text: str) -> bool:
 
 
 def rule_extract(content: str, ts_ms: int, at_all: bool = False) -> dict | None:
-    """返回一个 notification dict（不含 raw_message_id 等由调用方补齐的字段），或 None。"""
+    """返回一个 notification dict（不含 raw_message_id 等由调用方补齐的字段），或 None。
+
+    ## v3 起的门槛：**只有时间词不算通知**
+
+    以前的条件是 `有通知关键词 or 解析出时间`，于是任何提到日期的消息都会变成一条任务 ——
+    真实语料里这类误报长这样：「@张三 明天」「我下周三可能去不了」「今天是训练第二天，
+    大家继续加油」。用户的原话是"很多不是通知的内容也被做成任务"。
+
+    现在必须有**通知特征**（通知类关键词 / 强调词 / @全体）才建条：只有时间的那些交给
+    模型判断（`both` 模式下模型说了算），模型也不认为是通知就不建。
+
+    代价说清楚：`EXTRACTOR=rule` 时，一条**既没有通知词、又没有强调词**的真通知
+    （"下周三体检"里的"体检"已经补进词表，但总会有漏的）会被漏掉。所以 rule 模式
+    只适合"先跑通链路"，要判得准还是得用 `both`。
+    """
     text = (content or "").strip()
     if is_noise(text):
         return None
@@ -98,8 +131,8 @@ def rule_extract(content: str, ts_ms: int, at_all: bool = False) -> dict | None:
     has_emphasis = bool(EMPHASIS.search(text))
     guess = parse_due(text, ts_ms)
 
-    # 既没有通知关键词，也没有时间信息 → 不像任务，交给 LLM 那条路去处理
-    if not has_keyword and guess is None:
+    # 通知特征：三者有其一才算"像通知"
+    if not (has_keyword or has_emphasis or at_all):
         return None
 
     body = _strip_leading_marks(text)
@@ -116,6 +149,8 @@ def rule_extract(content: str, ts_ms: int, at_all: bool = False) -> dict | None:
         evidence = body[:120]
 
     confidence = 0.45
+    if has_keyword:
+        confidence += 0.1
     if guess is not None:
         confidence += 0.3
     if has_emphasis:

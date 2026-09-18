@@ -264,7 +264,9 @@ class World:
         if reset:
             await self.reset()
         headers = {"Authorization": f"Bearer {self.settings.api_token}"}
-        async with httpx.AsyncClient(base_url=self.base, timeout=10.0) as c:
+        # trust_env=False：别让测试走这台机器的系统代理（Windows 注册表里那条
+        # Clash/V2Ray 代理没开着时，连 127.0.0.1 都会被发过去然后连接被拒）。
+        async with httpx.AsyncClient(base_url=self.base, timeout=10.0, trust_env=False) as c:
             verify = await c.post("/api/verify/request", json={"qq": str(qq)}, headers=headers)
             verify.raise_for_status()
             code = str(verify.json()["code"])
@@ -307,7 +309,9 @@ class World:
         headers = {
             "Authorization": f"Bearer {(settings or self.settings).api_token}"
         }
-        async with httpx.AsyncClient(base_url=self.base, timeout=10.0) as c:
+        # trust_env=False：别让测试走这台机器的系统代理（Windows 注册表里那条
+        # Clash/V2Ray 代理没开着时，连 127.0.0.1 都会被发过去然后连接被拒）。
+        async with httpx.AsyncClient(base_url=self.base, timeout=10.0, trust_env=False) as c:
             resp = await c.post(
                 "/api/subscriptions",
                 params={"user_id": owner},
@@ -325,7 +329,9 @@ class World:
         import httpx
 
         headers = {"Authorization": f"Bearer {self.settings.api_token}"}
-        async with httpx.AsyncClient(base_url=self.base, timeout=10.0) as c:
+        # trust_env=False：别让测试走这台机器的系统代理（Windows 注册表里那条
+        # Clash/V2Ray 代理没开着时，连 127.0.0.1 都会被发过去然后连接被拒）。
+        async with httpx.AsyncClient(base_url=self.base, timeout=10.0, trust_env=False) as c:
             await c.post("/api/_fake/reset", headers=headers)
         self.users.clear()
         self.tokens.clear()

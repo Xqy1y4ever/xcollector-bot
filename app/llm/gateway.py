@@ -42,33 +42,60 @@ logger = logging.getLogger(__name__)
 # asyncio.run"的用法都会踩到，所以这里按循环分别持有。
 _CLIENT: httpx.AsyncClient | None = None
 _CLIENT_LOOP: asyncio.AbstractEventLoop | None = None
+# {是否本机地址: client} —— 见 `_client()` 的说明（本机地址不走系统代理）
+_CLIENTS: dict[bool, httpx.AsyncClient] = {}
 
 
-def _client() -> httpx.AsyncClient:
-    global _CLIENT, _CLIENT_LOOP
+def _is_local_url(url: str) -> bool:
+    """这个 URL 指向本机吗（127.0.0.1 / localhost / ::1）。"""
+    try:
+        host = (httpx.URL(url).host or "").lower()
+    except Exception:  # noqa: BLE001 - 解析不了就当不是本机（照常走系统代理）
+        return False
+    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
+def _client(url: str = "") -> httpx.AsyncClient:
+    """按目标 URL 选连接池：**本机地址不走系统代理**，公网地址照旧走。
+
+    为什么必须按 URL 分：httpx 的 `trust_env` 是客户端级选项，而它默认会读
+    Windows 注册表里的系统代理（装过 Clash / V2Ray 的机器上常留着一条
+    `127.0.0.1:7890`）。那个代理没开着的时候，连"本机自己起的模型服务"
+    （ollama / one-api 之类）都会连不上 —— 而**公网厂商该不该走代理由用户环境决定**，
+    不能一刀切（很多人正是靠代理才能访问 OpenAI/Google）。
+    """
+    global _CLIENT, _CLIENT_LOOP, _CLIENTS
     try:
         loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
     except RuntimeError:  # pragma: no cover - 调用方都是 async，正常走不到
         loop = None
 
-    if _CLIENT is None or _CLIENT.is_closed or _CLIENT_LOOP is not loop:
-        # 旧 client 属于别的（或已关闭的）循环，直接丢引用：
-        # 它的循环已经没了，没法再 await aclose()。
-        _CLIENT = httpx.AsyncClient(follow_redirects=True)
-        _CLIENT_LOOP = loop
-    return _CLIENT
+    local = _is_local_url(url)
+    cached = _CLIENTS.get(local)
+    if cached is not None and not cached.is_closed and _CLIENT_LOOP is loop:
+        return cached
+
+    # 旧 client 属于别的（或已关闭的）循环，直接丢引用：
+    # 它的循环已经没了，没法再 await aclose()。
+    client = httpx.AsyncClient(follow_redirects=True, trust_env=not local)
+    _CLIENTS[local] = client
+    _CLIENT = client
+    _CLIENT_LOOP = loop
+    return client
 
 
 async def close_client() -> None:
     """服务关停时调用，让连接池干净退出。
 
-    只关**当前循环**上的那个；属于别的循环的关不掉，交给 GC。
+    只关**当前循环**上的那些；属于别的循环的关不掉，交给 GC。
     """
-    global _CLIENT, _CLIENT_LOOP
+    global _CLIENT, _CLIENT_LOOP, _CLIENTS
     current = asyncio.get_running_loop()
-    if _CLIENT is not None and not _CLIENT.is_closed and _CLIENT_LOOP is current:
-        await _CLIENT.aclose()
     if _CLIENT_LOOP is current:
+        for client in _CLIENTS.values():
+            if client is not None and not client.is_closed:
+                await client.aclose()
+        _CLIENTS = {}
         _CLIENT = None
         _CLIENT_LOOP = None
 
@@ -143,7 +170,7 @@ async def acompletion(
     )
 
     try:
-        resp = await _client().post(url, headers=headers, json=body, timeout=timeout)
+        resp = await _client(url).post(url, headers=headers, json=body, timeout=timeout)
     except httpx.TimeoutException as exc:
         raise LLMError(
             f"调用 {provider.name} 超时（{timeout}s，model={target.model}）",

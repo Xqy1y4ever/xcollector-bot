@@ -163,16 +163,30 @@ class PendingWrites:
 # ---------------------------------------------------------------------------
 
 
+def _is_loopback(url: str) -> bool:
+    """`BACKEND_BASE_URL` 指的是本机吗（127.0.0.1 / localhost / ::1 / 0.0.0.0）。"""
+    try:
+        host = (httpx.URL(url).host or "").lower()
+    except Exception:  # noqa: BLE001 - 解析不了就当不是本机（照常走系统代理）
+        return False
+    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
 class BackendClient:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         headers: dict[str, str] = {}
         if self.settings.api_token:
             headers["Authorization"] = f"Bearer {self.settings.api_token}"
+        # **本机后端不走代理**：httpx 默认 `trust_env=True`，而它会读 Windows 注册表里的
+        # 系统代理（装过 Clash / V2Ray 之类工具的机器上常留着一条 `127.0.0.1:7890`）。
+        # 那个代理没开着的时候，连 `http://127.0.0.1:8000` 都会被发过去、然后连接被拒 ——
+        # 症状是"后端明明在本机跑着，bot 却说连不上"。公网后端照旧走系统代理。
         self._client = httpx.AsyncClient(
             base_url=self.settings.backend_base,
             timeout=self.settings.backend_timeout,
             headers=headers,
+            trust_env=not _is_loopback(self.settings.backend_base),
         )
         self.pending = PendingWrites(self.settings.pending_write_max)
 
