@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -31,22 +32,44 @@ from .providers import PROVIDERS, Provider
 logger = logging.getLogger(__name__)
 
 # 单例 client：复用连接池。超时按请求传，因为每个调用点可能不同。
+#
+# **必须连事件循环一起缓存**：httpx.AsyncClient 的连接池绑定在创建它的那个循环上。
+# 只缓存 client 的话，同一个进程里第二次 asyncio.run() 会拿到绑定在**已关闭循环**
+# 上的连接，一用就炸 `RuntimeError: Event loop is closed` —— 而且是从连接池清理里
+# 抛出来的，堆栈看着跟业务代码毫无关系，很难查。
+# bot 生产环境只有一个长驻循环，但测试、命令行工具、以及将来任何"一个进程里跑多次
+# asyncio.run"的用法都会踩到，所以这里按循环分别持有。
 _CLIENT: httpx.AsyncClient | None = None
+_CLIENT_LOOP: asyncio.AbstractEventLoop | None = None
 
 
 def _client() -> httpx.AsyncClient:
-    global _CLIENT
-    if _CLIENT is None or _CLIENT.is_closed:
+    global _CLIENT, _CLIENT_LOOP
+    try:
+        loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover - 调用方都是 async，正常走不到
+        loop = None
+
+    if _CLIENT is None or _CLIENT.is_closed or _CLIENT_LOOP is not loop:
+        # 旧 client 属于别的（或已关闭的）循环，直接丢引用：
+        # 它的循环已经没了，没法再 await aclose()。
         _CLIENT = httpx.AsyncClient(follow_redirects=True)
+        _CLIENT_LOOP = loop
     return _CLIENT
 
 
 async def close_client() -> None:
-    """服务关停时调用，让连接池干净退出。"""
-    global _CLIENT
-    if _CLIENT is not None and not _CLIENT.is_closed:
+    """服务关停时调用，让连接池干净退出。
+
+    只关**当前循环**上的那个；属于别的循环的关不掉，交给 GC。
+    """
+    global _CLIENT, _CLIENT_LOOP
+    current = asyncio.get_running_loop()
+    if _CLIENT is not None and not _CLIENT.is_closed and _CLIENT_LOOP is current:
         await _CLIENT.aclose()
-    _CLIENT = None
+    if _CLIENT_LOOP is current:
+        _CLIENT = None
+        _CLIENT_LOOP = None
 
 
 @dataclass

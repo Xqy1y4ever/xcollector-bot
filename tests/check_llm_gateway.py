@@ -556,6 +556,43 @@ def test_base_url_override(base: str) -> None:
     eq(_STATE["requests"][0]["path"], "/custom/v1/chat/completions", "base 覆盖 + 去掉尾部斜杠")
 
 
+def test_across_event_loops(base: str) -> None:
+    """同一个进程里跨多个事件循环调用。
+
+    网关缓存了一个 httpx.AsyncClient 做连接池，而连接池绑定在创建它的**事件循环**上。
+    如果只缓存 client 不缓存循环，第二次 asyncio.run() 会拿到绑定在已关闭循环上的
+    连接，一用就炸 `RuntimeError: Event loop is closed` —— 而且是从连接池清理里抛出来的，
+    堆栈跟业务代码毫无关系。
+
+    这个文件里每个用例都是一次 asyncio.run，本来就在走这条路，但那是隐式的：
+    只有池里恰好留着 keep-alive 连接时才炸（所以曾经偶发失败过）。这里显式写一条，
+    连续三次、每次一个新循环，把不变式钉住。
+    """
+    os.environ["OPENAI_API_KEY"] = "sk-test"
+    os.environ["OPENAI_API_BASE"] = f"{base}/v1"
+    _STATE["requests"].clear()
+    _STATE["responder"] = lambda path: (200, openai_response('{"n":1}'))
+
+    results = []
+    for i in range(3):
+        results.append(
+            asyncio.run(
+                acompletion(
+                    model="openai/gpt-4o-mini",
+                    messages=[{"role": "user", "content": f"第 {i} 次"}],
+                )
+            )
+        )
+
+    eq(len(results), 3, "跨事件循环：三次调用的返回值都拿到了")
+    check(
+        all(r.text == '{"n":1}' for r in results),
+        "跨事件循环：三次结果都正确",
+        str([r.text for r in results]),
+    )
+    eq(len(_STATE["requests"]), 3, "跨事件循环：真的发了三次请求")
+
+
 def main() -> int:
     server, base = _start_server()
     print(f"假厂商服务已启动：{base}\n")
@@ -573,6 +610,7 @@ def main() -> int:
         test_json_mode_shorthand(base)
         test_base_url_override(base)
         test_timeout(base)
+        test_across_event_loops(base)
     finally:
         server.shutdown()
         server.server_close()

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import suppress
 from typing import Any, Awaitable, Callable
 
@@ -33,6 +34,65 @@ except Exception:  # pragma: no cover - 兼容 websockets 12 的旧路径
     from websockets.client import connect as _ws_connect  # type: ignore
 
 MAX_FRAME = 32 * 1024 * 1024  # 合并转发的消息体可能很大
+
+# 一次连接存活超过这个秒数，才算"真的连上了"。
+#
+# 为什么按**存活时长**而不是按异常类型区分正常/异常断开：websockets 在干净关闭时
+# 也是**抛** ConnectionClosedOK（而不是让 recv() 返回 None），所以"对端重启导致的
+# 正常断开"和"连上就被踢"在异常类型上长得一模一样，只有时长能区分。
+#
+# 区分开的意义：
+#   存活够久 → 配置是对的，退避清零、立刻重连；
+#   刚连上就被踢 → 多半是配置问题（Token 不一致之类），退避增长，既不刷屏
+#                 也不反复锤对端。
+STABLE_SECONDS = 5.0
+
+
+def _retry_delay(consecutive_immediate_failures: int) -> float:
+    """连续发生这么多次"连上就被踢"之后，下一次等多久。
+
+    0（上一次连接是稳定的，或还没失败过）→ 1 秒，等价于立刻重连。
+    之后依次 1、2、4、8、16、32、60 秒封顶。
+    """
+    if consecutive_immediate_failures <= 0:
+        return 1.0
+    return min(2.0 ** (consecutive_immediate_failures - 1), 60.0)
+
+
+def _close_code(exc: BaseException) -> int | None:
+    """从 websockets 的 ConnectionClosed 里取关闭码，取不到返回 None。
+
+    不同大版本把关闭帧放在 `.rcvd` / `.sent`（Close 对象）或直接放 `.code`，
+    这里都试一遍。取不到不算错误，只是提示里少一个数字。
+    """
+    for attr in ("rcvd", "sent"):
+        code = getattr(getattr(exc, attr, None), "code", None)
+        if isinstance(code, int):
+            return code
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def _explain_disconnect(exc: BaseException, lasted: float) -> str:
+    """把断开原因翻译成"下一步该查什么"。
+
+    只打一句 `ConnectionClosedOK: received 1005` 是没用的 —— 1005 的意思是
+    对端根本没给状态码，光看它推不出任何结论。所以这里直接给出最可能的原因
+    和该去哪里确认。
+    """
+    if lasted >= STABLE_SECONDS:
+        return f"连接断开（已稳定运行 {lasted:.0f}s，多为对端重启或网络抖动），正在重连"
+
+    code = _close_code(exc)
+    shown = "未给出" if code is None else str(code)
+    return (
+        f"刚连上 {lasted:.1f}s 就被对端关闭（关闭码 {shown}）。"
+        "最常见的原因是 NapCat 的 WebSocket 服务器配了 Token，而 ONEBOT_ACCESS_TOKEN "
+        "没填或不一致 —— 照着 NapCat 里的值填，或改用 "
+        "ws://…:3001/?access_token=<token> 这种带在 URL 上的形式。"
+        "其次确认那个端口上确实是 NapCat 的 WebSocket 服务器。"
+        "确切原因以 NapCat 自己的日志为准。"
+    )
 
 
 class OneBotNotConnected(RuntimeError):
@@ -143,22 +203,38 @@ class OneBotHub:
     # ------------------------------------------------------------------
 
     async def _client_loop(self) -> None:
-        backoff = 1.0
+        immediate_failures = 0
         while not self._stopping:
+            started = time.monotonic()
             try:
                 await self._connect_once()
-                backoff = 1.0  # 正常断开（对端重启）后不要带着退避跑，立刻重连
+                # 接收循环干净结束（正常返回）：等价于一次稳定连接
+                immediate_failures = 0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                lasted = time.monotonic() - started
+                # 按"这次连接活了多久"归零或累加。必须在算 delay **之前**做，
+                # 否则会把之前连不上时累积的 60s 带到"稳定跑了一小时才断开"
+                # 的场景里 —— 那种情况应该立刻重连。
+                if lasted >= STABLE_SECONDS:
+                    immediate_failures = 0
+                else:
+                    immediate_failures += 1
+                delay = _retry_delay(immediate_failures)
+
                 self.last_error = f"{type(exc).__name__}: {exc}"
+                # 说明单独一行：它往往很长（要给出"下一步查什么"），
+                # 跟在错误后面用逗号接一截会读成一句话，看不清哪个是重点。
                 logger.warning(
-                    "OneBot 连接失败: %s，%.0fs 后重试", self.last_error, backoff
+                    "OneBot 连接失败（%.0fs 后重试）: %s\n    ↳ %s",
+                    delay,
+                    self.last_error,
+                    _explain_disconnect(exc, lasted),
                 )
                 self.connected = False
                 self.reconnect_count += 1
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+                await asyncio.sleep(delay)
 
     async def _connect_once(self) -> None:
         url = self.settings.onebot_ws_url

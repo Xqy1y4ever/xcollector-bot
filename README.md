@@ -128,6 +128,31 @@ URL 填 `ws://<bot 所在机器 IP>:8081/onebot/ws`。
 换模式后需要重启 bot。用 Docker 部署时，`ONEBOT_MODE=server` 还需要把 8081
 端口发布出来（编排里默认已经发布）。
 
+### 连不上，或者连上就被断开？
+
+日志会直接说明原因。最常见的现象是「已连接」之后**立刻**断开：
+
+```
+INFO    OneBot 已连接 (client): ws://host.docker.internal:3001
+WARNING OneBot 连接失败（1s 后重试）: ConnectionClosedOK: received 1005 ...
+    ↳ 刚连上 0.1s 就被对端关闭（关闭码 1005）。最常见的原因是 NapCat 的 WebSocket
+      服务器配了 Token，而 ONEBOT_ACCESS_TOKEN 没填或不一致 ...
+```
+
+按这个顺序查：
+
+1. **Token 对不上** —— 头号原因。NapCat 的 WebSocket 服务器配置里如果填了
+   Token，bot 这边的 `ONEBOT_ACCESS_TOKEN` 必须是**完全一样**的值。
+   有些版本只认 URL 上的参数，那就把地址写成
+   `ws://host.docker.internal:3001/?access_token=<token>`。
+2. **看 NapCat 自己的日志** —— 关连接的是它，它才知道为什么。
+3. **确认那个端口上确实是 NapCat 的 WebSocket 服务器**，不是它的 HTTP 服务、
+   也不是另一个 OneBot 实现。
+4. **别让两个东西连同一个 NapCat** —— 同一个 QQ 被两条链路收消息会重复入库。
+
+连接断开后 bot 会自动重连：**稳定运行过一段时间再断开**（NapCat 重启、网络抖动）
+是 1 秒后立刻重连；**连上就被踢**（多半是上面的配置问题）才会逐步退避到最多 60 秒。
+
 ## 大模型配置
 
 模型名写成 `厂商/模型名`，网关自动按前缀选择协议，不需要装任何 SDK：
@@ -237,6 +262,7 @@ bot 对前端暴露这些接口，都带 `Authorization: Bearer <令牌>`：
 .\.venv\Scripts\python.exe -m tests.check_location      # 地点提取
 .\.venv\Scripts\python.exe -m tests.check_commands      # 指令解析与排版
 .\.venv\Scripts\python.exe -m tests.check_llm_gateway   # 大模型网关
+.\.venv\Scripts\python.exe -m tests.check_onebot_reconnect  # 断线重连与提示
 
 # 端到端（真 bot 代码 + 假后端，推荐先跑这个）
 .\.venv\Scripts\python.exe -m tests.check_pipeline_e2e
