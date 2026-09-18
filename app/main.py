@@ -25,11 +25,11 @@ from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, FastAPI, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, Query, WebSocket
 from pydantic import BaseModel, field_validator
 
 from . import __version__
-from .auth import Scope, require_token, require_write
+from .auth import require_admin
 from .llm.target import target_from_settings
 from .backend_client import BackendClient, BackendError
 from .commands import CommandRouter
@@ -38,7 +38,13 @@ from .logging_setup import setup_logging
 from .normalize import MessageNormalizer, NormalizedMessage, message_kind
 from .onebot import OneBotHub, OneBotNotConnected
 from .onebot.hub import interpret_send_result
-from .pipeline.digest import build_digest, configure_digest, digest_loop, send_digest
+from .pipeline.digest import (
+    build_digest,
+    configure_digest,
+    digest_loop,
+    resolve_recipients,
+    send_digest,
+)
 from .pipeline.runner import (
     close_media_client,
     finish_message,
@@ -70,6 +76,10 @@ RECOVERY_SWEEP_SECONDS = 60.0
 # 盲区计数的时间窗口（和后端原来的 `_blindspots()` 保持一致）
 UNPARSED_WINDOW_DAYS = 7
 
+# 状态页的按用户数字要一个个问后端，所以限制规模并并发拉：
+# 手动刷新的管理页不值得为一个大部署无限拉，但也不能串行等到超时。
+STATUS_MAX_USERS = 50
+STATUS_FANOUT_CONCURRENCY = 8
 
 # ---------------------------------------------------------------------------
 # 两段式消息流水线
@@ -384,15 +394,13 @@ class BotRuntime:
             # 这条 WARNING 是刻意留的：/api/send/* 能冒充机器人发言，
             # 忘了配 token 就等于把它暴露给任何能访问这个端口的人。
             logger.warning("BOT_API_TOKEN / API_TOKEN 均为空：/api/* 不校验认证，仅限本地开发使用")
-        elif settings.web_scope_separated:
-            logger.info(
-                "网页令牌已分离：WEB_API_TOKEN 只能看 /api/status 与 /api/digest/preview，"
-                "发消息类接口（send/*、digest/send）只认管理令牌"
-            )
         else:
-            logger.warning(
-                "WEB_API_TOKEN 未配置（或与管理令牌相同）：网页那个令牌拥有**完整权限**，"
-                "包括以你的身份发 QQ 消息。请单独设一个不同的 WEB_API_TOKEN。"
+            # 多用户之后不再有"网页令牌"这个东西：前端拿的是每个用户自己的
+            # UserToken，而 bot 不认识它。所以 /api/status 这类运营者视角的接口
+            # 只有拿管理令牌的人能看 —— 普通用户看不到所有人的盲区计数。
+            logger.info(
+                "bot 自己的 /api/* 需要管理令牌（BOT_API_TOKEN / API_TOKEN）；"
+                "用户拿的 UserToken 只能调后端，调不了这里"
             )
         if not settings.command_whitelist_map:
             logger.warning("COMMAND_WHITELIST 为空：当前没有任何 QQ 号能发指令")
@@ -523,11 +531,97 @@ class BotRuntime:
             logger.warning("状态页读取 %s 异常：%s", what, exc)
             return default
 
+    async def _per_user_rollup(self, users: list[dict]) -> list[dict]:
+        """把状态页里那些**按用户**的数字一个个用户地取回来。
+
+        多用户之后，"盲区有几个"不再是一个数：A 的源里解析失败，和 B 无关。
+        所以状态页要给的是**分用户的清单**，不是一个全站数字。
+
+        代价是 O(用户数) 次请求，所以这里并发拉（而不是串行等），
+        并且用户数超过 STATUS_MAX_USERS 时截断 —— 状态页是个手动刷新的
+        管理页，不值得为了让一个大部署的第一次渲染变慢而无限拉。
+        """
+        settings = self.settings
+        day = local_day()
+        picked = users[:STATUS_MAX_USERS]
+        sem = asyncio.Semaphore(STATUS_FANOUT_CONCURRENCY)
+
+        async def one(user: dict) -> dict:
+            uid = str(user.get("id") or "")
+            if not uid:
+                return {}
+            async with sem:
+                stat, conflicts, low, digest_sent, alerts = await asyncio.gather(
+                    self._safe(self.backend.get_stats(day, user_id=uid), {}, "stats"),
+                    self._safe(
+                        self.backend.count_notifications(user_id=uid, conflict=True),
+                        0,
+                        "conflict count",
+                    ),
+                    self._safe(
+                        self.backend.count_notifications(
+                            user_id=uid,
+                            low_confidence_below=settings.low_confidence_threshold,
+                        ),
+                        0,
+                        "low confidence count",
+                    ),
+                    self._safe(
+                        self.backend.count_digest_logs(
+                            user_id=uid, day=day, kind="auto", sent=True
+                        ),
+                        0,
+                        "digest log",
+                    ),
+                    self._safe(
+                        self.backend.list_gap_alerts(user_id=uid, acknowledged=False, limit=20),
+                        [],
+                        "gap-alerts",
+                    ),
+                )
+            return {
+                "user_id": uid,
+                "qq": user.get("qq"),
+                "display_name": user.get("display_name"),
+                "stat": stat if isinstance(stat, dict) else {},
+                "conflict_count": int(conflicts or 0),
+                "low_confidence_count": int(low or 0),
+                "digest_sent_today": int(digest_sent or 0) > 0,
+                "open_gap_alerts": len(alerts or []),
+                "stat_available": bool(stat),
+                "conflict_available": True,
+            }
+
+        rows = await asyncio.gather(*(one(u) for u in picked))
+        return [r for r in rows if r]
+
+    @staticmethod
+    def _sum_stats(rows: list[dict]) -> dict:
+        """把每个用户的 pipeline_stat 累加起来。
+
+        **这不是"全站处理量"**：一条消息扇给 N 个人就会计 N 次
+        （因为它确实替 N 个人各处理了一次）。状态页上必须标出来，
+        否则运维会以为"今天处理了 300 条"，而实际上只有 30 条原始消息。
+        """
+        total: dict[str, int] = {}
+        for row in rows:
+            for key, value in (row.get("stat") or {}).items():
+                try:
+                    total[key] = total.get(key, 0) + int(value or 0)
+                except (TypeError, ValueError):
+                    continue
+        return total
+
     async def status_payload(self) -> dict:
         """`GET /api/status` 的完整结构（契约第 9 节）。
 
         盲区计数、群列表、缺口告警全部**现算**：后端只剩存储，
         它不知道"盲区"是什么意思。
+
+        多用户之后这里分两层：
+          - **共享层**（原始消息、群状态）本来就是全站的，照旧一个数字；
+          - **按用户层**（通知冲突、低置信、digest、缺口）按用户各算一份，
+            `per_user` 给出清单，标量字段是它们的累加。
         """
         settings = self.settings
         backend = self.backend
@@ -537,27 +631,14 @@ class BotRuntime:
         health = await backend.health()
         reachable = bool(health.get("reachable"))
 
-        stat: dict = {}
         groups: list[dict] = []
-        alerts: list[dict] = []
         unparsed_count = 0
-        conflict_count = 0
-        low_confidence_count = 0
-        digest_sent_count = 0
+        per_user: list[dict] = []
 
         if reachable:
-            (
-                stat,
-                groups,
-                alerts,
-                unparsed_count,
-                conflict_count,
-                low_confidence_count,
-                digest_sent_count,
-            ) = await asyncio.gather(
-                self._safe(backend.get_stats(day), {}, "stats"),
+            users, groups, unparsed_count = await asyncio.gather(
+                self._safe(backend.list_users(), [], "users"),
                 self._safe(backend.list_groups(), [], "groups"),
-                self._safe(backend.list_gap_alerts(acknowledged=False, limit=20), [], "gap-alerts"),
                 self._safe(
                     backend.count_messages(
                         state=["unparsed", "degraded"],
@@ -566,18 +647,22 @@ class BotRuntime:
                     0,
                     "unparsed count",
                 ),
-                self._safe(backend.count_notifications(conflict=True), 0, "conflict count"),
-                self._safe(
-                    backend.count_notifications(
-                        low_confidence_below=settings.low_confidence_threshold
-                    ),
-                    0,
-                    "low confidence count",
-                ),
-                self._safe(
-                    backend.count_digest_logs(day=day, kind="auto", sent=True), 0, "digest log"
-                ),
             )
+            per_user = await self._per_user_rollup(users or [])
+
+        stat = self._sum_stats(per_user)
+        conflict_count = sum(r["conflict_count"] for r in per_user)
+        low_confidence_count = sum(r["low_confidence_count"] for r in per_user)
+        alerts = [a for r in per_user for a in (r.get("gap_alerts") or [])]
+        digest_sent_count = sum(1 for r in per_user if r["digest_sent_today"])
+
+        # 有多少用户的按用户数字**没取到**（后端部分失败）。状态页必须能显示这个，
+        # 否则"0 个冲突"和"没问出来"长得一模一样 —— 那是最误导人的一种绿。
+        users_missing = sum(
+            1
+            for r in per_user
+            if not r.get("stat_available") or not r.get("conflict_available")
+        )
 
         return {
             "onebot": self.hub.status(),
@@ -606,12 +691,17 @@ class BotRuntime:
                 "ready": settings.whitelist_ready,
             },
             "pipeline": {
+                # ⚠️ 这些是**按用户累加**的（见 _sum_stats）：一条消息扇给 N 个人
+                # 会计 N 次。单用户部署下和以前完全一样；多用户部署下它会大于
+                # "今天真正处理了几条原始消息"，所以状态页上必须标出来。
                 "today_ingested": int(stat.get("ingested") or 0),
                 "today_extracted": int(stat.get("extracted") or 0),
                 "today_unparsed": int(stat.get("unparsed") or 0),
                 "today_conflicts": int(stat.get("conflicts") or 0),
                 "today_degraded": int(stat.get("degraded") or 0),
                 "today_llm_tokens": int(stat.get("llm_tokens") or 0),
+                "per_user_aggregate": True,
+                "users_counted": len(per_user),
                 # bot 自己的运行时计数（不是后端的）
                 "queue_depth": self.pipeline.depth,
                 "processed": self.pipeline.processed,
@@ -626,6 +716,13 @@ class BotRuntime:
                 "low_confidence_count": low_confidence_count,
                 "degraded_today": int(stat.get("degraded") or 0) > 0,
                 "window_days": UNPARSED_WINDOW_DAYS,
+                # 上面三个标量是**按用户累加**的（同一条消息扇给 N 个人会计 N 次），
+                # 所以真正的清单在这里。运维要判断"谁的源出问题了"只能看这个。
+                "per_user": per_user,
+                # >0 说明有用户的按用户数字没取到 —— 那几行的 0 是缺失，不是真的没有
+                "users_missing": users_missing,
+                "users_counted": len(per_user),
+                "aggregate_note": "标量是按用户累加：一条消息扇给 N 个人会计 N 次",
             },
             "groups": self._merge_groups(groups, now),
             "gap_alerts": alerts,
@@ -635,7 +732,9 @@ class BotRuntime:
                 "enabled": settings.digest_enabled,
                 "time": settings.digest_time,
                 "target_qq": settings.digest_target_qq,
-                "sent_today": digest_sent_count > 0,
+                # 多用户之后不再有单一的"今天发过没有"：每个用户各有一份
+                "sent_today": digest_sent_count,
+                "sent_today_all": bool(per_user) and digest_sent_count == len(per_user),
             },
             "day": day,
             "server_time": now,
@@ -746,14 +845,14 @@ api = APIRouter(prefix="/api")
 # ---------------------------------------------------------------------------
 # 认证：实现见 app/auth.py
 #
-# 两个范围：管理令牌（BOT_API_TOKEN / API_TOKEN）什么都能调；网页令牌
-# （WEB_API_TOKEN）只能看状态和预览摘要 —— 发消息类的接口一律 403。
-# 理由：网页令牌要给登录页，而"任何人拿到它就能以你的身份发 QQ 消息"
-# 是比"能改数据库"更直接的后果。
+# 只有一种令牌：管理令牌（BOT_API_TOKEN / API_TOKEN），所有 /api/* 都要它。
+# 理由：这些接口能**以你的身份发 QQ 消息**，还能看到所有人的盲区计数和
+# OneBot 连接状态 —— 那是运营者视角，不该给任何一个普通用户。
+# 用户拿的 UserToken 是后端的凭据，bot 不认识它。
 # ---------------------------------------------------------------------------
 
-AuthDep = Annotated[Scope, Depends(require_token)]
-WriteDep = Annotated[Scope, Depends(require_write)]
+AuthDep = Annotated[None, Depends(require_admin)]
+WriteDep = AuthDep
 
 
 # ---------------------------------------------------------------------------
@@ -795,6 +894,9 @@ class SendGroupBody(BaseModel):
 
 class DigestSendBody(BaseModel):
     dry_run: bool = True
+    # 只发给这一个用户（不传 = 按收件人名单逐个发）。排查某个人的 digest
+    # 长什么样时用得上。
+    user_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -867,10 +969,47 @@ async def status(_: AuthDep) -> dict:
 
 
 @api.get("/digest/preview")
-async def digest_preview(_: AuthDep) -> dict:
+async def digest_preview(
+    _: AuthDep, user_id: str | None = Query(default=None)
+) -> dict:
+    """预览 digest。
+
+    多用户之后 digest 是**按人**组装的，所以这里必须知道"预览谁的"。
+    不传 `user_id` 就用第一个收件人（单用户部署下就是那唯一一个人），
+    并在响应里把用的是谁写清楚 —— 预览了一份别人的 digest 却以为是自己的，
+    比不预览更危险。
+    """
     runtime = get_runtime()
-    text = await build_digest(runtime.backend, runtime.settings)
-    return {"text": text}
+    targets = await resolve_recipients(runtime.backend, runtime.settings)
+    if not targets:
+        return {
+            "text": "",
+            "user_id": None,
+            "qq": None,
+            "error": "没有可预览的收件人（还没有注册用户）",
+        }
+
+    picked = None
+    if user_id:
+        picked = next((t for t in targets if t[1] == user_id), None)
+        if picked is None:
+            return {
+                "text": "",
+                "user_id": user_id,
+                "qq": None,
+                "error": f"user_id={user_id} 不在收件人名单里",
+            }
+    else:
+        picked = targets[0]
+
+    text = await build_digest(runtime.backend, runtime.settings, user_id=picked[1])
+    return {
+        "text": text,
+        "user_id": picked[1],
+        "qq": picked[0],
+        "recipients": [{"qq": qq, "user_id": uid} for qq, uid in targets],
+        "error": None,
+    }
 
 
 @api.post("/digest/send")
@@ -879,6 +1018,7 @@ async def digest_send(body: DigestSendBody, _: WriteDep) -> dict:
     return await send_digest(
         dry_run=bool(body.dry_run),
         kind="manual",
+        user_id=body.user_id,
         backend=runtime.backend,
         sender=runtime.hub,
     )

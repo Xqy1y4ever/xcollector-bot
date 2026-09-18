@@ -41,7 +41,7 @@ import logging
 import mimetypes
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import httpx
 
@@ -384,6 +384,56 @@ def build_notification_payload(
     }
 
 
+async def _fan_out(
+    backend: BackendClient, payload: dict, owners: Sequence[str]
+) -> int:
+    """把**同一份**抽取结果写给名单里的每个用户，返回成功建条的条数。
+
+    这是"并集处理"的另一半：上游只调用了一次模型，这里把结果复制成 N 条
+    属于各自用户的通知。每一条都是独立的一行（各自的读/完成/修正状态），
+    所以 A 把一条标成完成，B 的那条纹丝不动。
+
+    失败语义要分清，否则会静默丢通知：
+
+      - **4xx（BackendRejected）**：重试多少次结果都一样，跳过这个用户并记
+        ERROR。注意**不能**因此把整条 raw 标成终态 —— 后端拒绝的可能是
+        "这个用户的 payload 有问题"，但别的用户完全可能建成功。
+      - **其它错误（不可达 / 5xx）**：真的没写进去。继续试剩下的用户
+        （一个用户的失败不该连累别人），但要把计数漏掉 —— 返回的条数
+        少于 len(owners) 时调用方会看到，raw 也不会被标成 extracted。
+    """
+    created = 0
+    for user_id in owners:
+        try:
+            await backend.create_notification(payload, user_id=user_id)
+        except BackendRejected as exc:
+            # 终态：这个用户的这一条永远建不出来，如实记 ERROR 不要重试
+            logger.error(
+                "建通知被后端拒绝（终态）raw=%s user=%s：%s",
+                payload.get("raw_message_id"),
+                user_id,
+                exc,
+            )
+            continue
+        except BackendError as exc:
+            logger.error(
+                "建通知失败 raw=%s user=%s（保持 pending 等待恢复）：%s",
+                payload.get("raw_message_id"),
+                user_id,
+                exc,
+            )
+            continue
+        created += 1
+    if created < len(owners):
+        logger.warning(
+            "扇出未完成 raw=%s：%d/%d 个用户建条成功",
+            payload.get("raw_message_id"),
+            created,
+            len(owners),
+        )
+    return created
+
+
 # ---------------------------------------------------------------------------
 # 后端写入的小工具（都不让"顺手的一步"拖垮整条链路）
 # ---------------------------------------------------------------------------
@@ -405,15 +455,33 @@ async def _patch_state(
         logger.warning("更新 raw 状态失败 raw=%s state=%s: %s", raw_id, state, exc)
 
 
-async def _bump_stats(backend: BackendClient, fields: dict[str, int]) -> None:
-    """统计写失败只记 warning：它不该让一条已经入库的通知变成"失败"。"""
+async def _bump_stats(
+    backend: BackendClient, user_id: str, fields: dict[str, int]
+) -> None:
+    """统计写失败只记 warning：它不该让一条已经入库的通知变成"失败"。
+
+    `user_id` 必填：统计是按用户的（见 backend_client.add_stats 的说明）。
+    """
     fields = {k: int(v) for k, v in fields.items() if v}
     if not fields:
         return
     try:
-        await backend.add_stats(local_day(), fields)
+        await backend.add_stats(local_day(), fields, user_id=user_id)
     except BackendError as exc:
-        logger.warning("写统计失败 fields=%s: %s", fields, exc)
+        logger.warning("写统计失败 user=%s fields=%s: %s", user_id, fields, exc)
+
+
+async def _bump_stats_for(
+    backend: BackendClient, user_ids: Iterable[str], fields: dict[str, int]
+) -> None:
+    """给名单里的每个人各记一次同样的统计。
+
+    扇出之后，"处理了一条消息"这件事对名单里的每个人都是真的发生过的
+    （那条通知确实是替他抽的）。所以这不是重复计数，而是把同一份工作
+    记到每个受益者头上。
+    """
+    for user_id in user_ids:
+        await _bump_stats(backend, user_id, fields)
 
 
 def _outcome_stats(
@@ -467,22 +535,39 @@ async def _maybe_gap_alert(
     if gap_ms <= settings.gap_alert_hours * 3600 * 1000:
         return
     hours = round(gap_ms / 3600000, 1)
+    group_id = str(raw.get("group_id") or "")
+
+    # 缺口是**群级**事件，但告警要按用户扇出：只有关心这个群的人才该收到。
+    # 名单问的是"这个群里任何发送者"（不给 sender_id）—— 用户订的是 (群, 发送者)，
+    # 但"这个群断了一段"影响到他订的每一个发送者。
     try:
-        await backend.create_gap_alert(
-            group_id=str(raw.get("group_id") or ""),
-            group_name=raw.get("group_name"),
-            from_ts=previous,
-            to_ts=current,
-            reason=f"两条消息间隔 {hours} 小时，此期间的通知可能已永久丢失",
-        )
+        owners = await backend.find_subscribers(group_id)
     except BackendError as exc:
-        logger.warning("写缺口告警失败：%s", exc)
+        logger.warning("查缺口告警的投递名单失败 group=%s: %s", group_id, exc)
         return
+    if not owners:
+        return
+
+    reason = f"两条消息间隔 {hours} 小时，此期间的通知可能已永久丢失"
+    for user_id in owners:
+        try:
+            await backend.create_gap_alert(
+                user_id=user_id,
+                group_id=group_id,
+                group_name=raw.get("group_name"),
+                from_ts=previous,
+                to_ts=current,
+                reason=reason,
+            )
+        except BackendError as exc:
+            logger.warning("写缺口告警失败 user=%s：%s", user_id, exc)
+
     logger.warning(
-        "群 %s(%s) 两条消息间隔 %.1f 小时，已生成缺口告警",
+        "群 %s(%s) 两条消息间隔 %.1f 小时，已给 %d 个用户生成缺口告警",
         raw.get("group_name"),
-        raw.get("group_id"),
+        group_id,
         hours,
+        len(owners),
     )
 
 
@@ -626,19 +711,53 @@ async def process_raw(
     images: Iterable[str] = (),
     is_new: bool = True,
 ) -> str:
-    """发送者白名单 → 抽取 → 建条/标状态 → 统计 → 一行日志。
+    """路由 → 发送者白名单 → 抽取**一次** → 扇出给每个订阅者 → 统计 → 一行日志。
 
     抽出来单独一个函数，是因为这段**不依赖 OneBot**：只要有一行已入库的 raw
     就能跑（手动 /add 走的也是这条路）。返回结果字符串即日志里的 `结果=`。
+
+    多用户之后这一段是整个系统的中枢，顺序不能乱：
+
+      1. **先问谁要**（`find_subscribers`）。没人要就不抽 —— LLM 调用是这条
+         流水线唯一花钱的地方，为没人订阅的来源花钱是最容易失控的成本。
+      2. **只抽一次**。同一个 (群, 发送者) 被 N 个人订阅，仍然只调用一次模型。
+         这是"并集处理"的全部意义：扇出的是**结果**，不是工作。
+      3. **按名单扇出**。每条通知各带自己的 user_id，各自独立地被读/完成/修正。
     """
     settings = settings or get_settings()
     doc = _canonical(raw)
+    group_id = str(doc.get("group_id") or "")
+    sender_id = str(doc.get("sender_id") or "")
 
     try:
+        # ---- 路由：这条消息有人要吗？ ----
+        try:
+            owners = await backend.find_subscribers(group_id, sender_id)
+        except BackendError as exc:
+            # 查不到名单时**不能**当成"没人要"：那会把本该建的通知永久吞掉，
+            # 而且 raw 会被标成终态，恢复循环也不会再试。
+            # 保持 pending，让启动/重连/每分钟的恢复循环捡回来重试。
+            reason = f"查投递名单失败，保持 pending：{exc}"
+            logger.error("raw=%s %s", raw_id, reason)
+            log_message(doc, "error", raw_id=raw_id, 原因=reason)
+            return "error"
+
+        if not owners:
+            # 没有订阅者 ≠ 出错：它只是"这条消息跟任何人都无关"。
+            # 标成终态，否则恢复循环会每分钟重抽一次没人要的消息。
+            await _patch_state(backend, raw_id, "unsubscribed", "没有任何用户订阅这个来源")
+            log_message(
+                doc,
+                "unsubscribed",
+                raw_id=raw_id,
+                发送者=f"{doc.get('sender_name')}({sender_id})",
+            )
+            return "unsubscribed"
+
         # ---- 发送者白名单 ----
-        if not settings.in_sender_whitelist(doc.get("sender_id")):
+        if not settings.in_sender_whitelist(sender_id):
             await _patch_state(backend, raw_id, "skipped_whitelist", "发送者不在白名单")
-            await _bump_stats(backend, _outcome_stats(
+            await _bump_stats_for(backend, owners, _outcome_stats(
                 is_new=is_new, outcome="skipped_whitelist",
                 degraded=False, conflict=False, tokens=0,
             ))
@@ -646,11 +765,11 @@ async def process_raw(
                 doc,
                 "skipped_whitelist",
                 raw_id=raw_id,
-                发送者=f"{doc.get('sender_name')}({doc.get('sender_id')})",
+                发送者=f"{doc.get('sender_name')}({sender_id})",
             )
             return "skipped_whitelist"
 
-        # ---- 抽取 ----
+        # ---- 抽取（一次） ----
         started = time.monotonic()
         result, degraded, tokens = await parse_content(doc, settings, images)
         log_stage(
@@ -660,6 +779,7 @@ async def process_raw(
             模型=(result or {}).get("model") if result else None,
             tokens=tokens or None,
             降级="是" if degraded else None,
+            订阅者=len(owners),
             耗时=elapsed_ms(started),
         )
 
@@ -668,7 +788,7 @@ async def process_raw(
                 # LLM 失败、规则也没兜住 —— 这是真的盲区
                 reason = "LLM 失败且规则也无法解析"
                 await _patch_state(backend, raw_id, "degraded", reason)
-                await _bump_stats(backend, _outcome_stats(
+                await _bump_stats_for(backend, owners, _outcome_stats(
                     is_new=is_new, outcome="degraded",
                     degraded=True, conflict=False, tokens=tokens,
                 ))
@@ -676,7 +796,7 @@ async def process_raw(
                 return "degraded"
             # 判定为闲聊/回执，属于正常结果，不该计入"未能解析"
             await _patch_state(backend, raw_id, "noise", "判定为非通知")
-            await _bump_stats(backend, _outcome_stats(
+            await _bump_stats_for(backend, owners, _outcome_stats(
                 is_new=is_new, outcome="noise",
                 degraded=False, conflict=False, tokens=tokens,
             ))
@@ -688,32 +808,23 @@ async def process_raw(
             # 硬约束：没有证据的条目宁可不要
             reason = "抽取结果缺少 evidence，已拒绝建条"
             await _patch_state(backend, raw_id, "unparsed", reason)
-            await _bump_stats(backend, _outcome_stats(
+            await _bump_stats_for(backend, owners, _outcome_stats(
                 is_new=is_new, outcome="unparsed",
                 degraded=degraded, conflict=False, tokens=tokens,
             ))
             log_message(doc, "unparsed", raw_id=raw_id, 原因=reason, 抽取器=settings.extractor)
             return "unparsed"
 
-        # ---- 建条 ----
-        try:
-            await backend.create_notification(payload)
-        except BackendRejected as exc:
-            # 4xx：重试多少次结果都一样（比如 evidence 被后端拒了）。
-            # 标成终态 `error`，否则恢复循环会每分钟重试一个永远失败的请求。
-            reason = f"建通知被后端拒绝：{exc}"
-            await _patch_state(backend, raw_id, "error", reason)
-            log_message(doc, "error", raw_id=raw_id, 原因=reason)
-            return "error"
-        except BackendError as exc:
-            # 暂时性失败：raw 停在 pending，恢复循环（启动 / 重连 / 每分钟）会把它
-            # 捡回来重新走一遍。原文没丢，这里如实记一行 ERROR。
-            logger.error("建通知失败，raw=%s 保持 pending 等待恢复：%s", raw_id, exc)
-            log_message(doc, "error", raw_id=raw_id, 原因=f"建通知失败，等待恢复：{exc}")
+        # ---- 扇出：同一次抽取，给每个订阅者写一条自己的通知 ----
+        fanned = await _fan_out(backend, payload, owners)
+        if fanned == 0:
+            # 一条都没建成：raw 保持 pending，让恢复循环重试。
+            # 注意 4xx 已经在 _fan_out 里区分过了（那些是终态，不该重试）。
+            log_message(doc, "error", raw_id=raw_id, 原因="所有订阅者建条都失败了")
             return "error"
 
         await _patch_state(backend, raw_id, "extracted")
-        await _bump_stats(backend, _outcome_stats(
+        await _bump_stats_for(backend, owners, _outcome_stats(
             is_new=is_new, outcome="extracted",
             degraded=degraded, conflict=bool(payload.get("conflict")), tokens=tokens,
         ))
@@ -822,6 +933,7 @@ async def resume_pending(
 
 async def create_manual_notification(
     *,
+    user_id: str,
     text: str,
     sender_id: str,
     sender_name: str,
@@ -832,8 +944,10 @@ async def create_manual_notification(
 ) -> dict:
     """手动 /add 建条：POST /api/messages + POST /api/notifications。
 
-    手动任务没有"群消息"这个客观事实，所以不走进群白名单、也不做缺口检测；
-    但**入库的形状和群消息完全一样**，这样前端只需要认识一种数据。
+    手动任务没有"群消息"这个客观事实，所以不走进群白名单、不做缺口检测、
+    也**不走订阅路由** —— 它是某个用户在 QQ 里亲手打的，归属就是他自己
+    （`user_id`），不该扇给任何别人。原文仍然写进共享的 raw 层，
+    这样前端只需要认识一种数据。
     """
     stamp = int(ts or now_ms())
     raw = {
@@ -867,11 +981,12 @@ async def create_manual_notification(
 
     notif_payload = build_notification_payload(raw_id, doc, safe_result)
     assert notif_payload is not None  # evidence 上面已兜住
-    created = await backend.create_notification(notif_payload)
+    created = await backend.create_notification(notif_payload, user_id=user_id)
 
     await _patch_state(backend, raw_id, "extracted")
     await _bump_stats(
         backend,
+        user_id,
         _outcome_stats(
             is_new=True,
             outcome="extracted",

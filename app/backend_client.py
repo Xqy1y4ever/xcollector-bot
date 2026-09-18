@@ -176,6 +176,26 @@ class BackendClient:
         )
         self.pending = PendingWrites(self.settings.pending_write_max)
 
+    # ------------------------------------------------------------------
+    # 归属（多用户之后每个按用户的接口都要带）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _owner(user_id: str) -> list[tuple[str, str]]:
+        """把 `user_id` 拼成 query 参数。
+
+        bot 用的是**服务令牌**，后端认不出"这次是在替谁办事"，所以每个按用户的
+        接口都必须显式带上归属，否则后端一律 400。契约里 `user_id` 全是 query
+        参数（不是 body 字段），所以这里统一走这条路径。
+
+        空值直接抛：后端会 400，但那样错误发生在一次网络往返之后，
+        而且日志里只看得到一个 HTTP 400 —— 在原地炸掉更容易定位。
+        """
+        owner = str(user_id or "").strip()
+        if not owner:
+            raise ValueError("按用户的接口必须带 user_id（bot 用服务令牌，后端认不出归属）")
+        return [("user_id", owner)]
+
     async def close(self) -> None:
         await self._client.aclose()
 
@@ -252,13 +272,17 @@ class BackendClient:
         url: str,
         *,
         json: dict | None = None,
+        params: Any = None,
         purpose: str = "",
         retries: int | None = None,
     ) -> httpx.Response:
-        """写接口：默认按 BACKEND_MAX_RETRIES 重试（1s/2s/4s）。"""
+        """写接口：默认按 BACKEND_MAX_RETRIES 重试（1s/2s/4s）。
+
+        `params` 用来带 `user_id`（契约里归属一律是 query 参数，不在 body 里）。
+        """
         total = self.settings.backend_max_retries if retries is None else retries
         return await self._request(
-            method, url, json=json, purpose=purpose, retries=total
+            method, url, json=json, params=params, purpose=purpose, retries=total
         )
 
     async def _json(self, method: str, url: str, **kwargs: Any) -> Any:
@@ -380,8 +404,13 @@ class BackendClient:
     # 通知 notification
     # ------------------------------------------------------------------
 
-    async def create_notification(self, payload: dict, *, retries: int | None = None) -> dict:
-        """POST /api/notifications（按 raw_message_id 幂等）→ {id, created}。
+    async def create_notification(
+        self, payload: dict, *, user_id: str, retries: int | None = None
+    ) -> dict:
+        """POST /api/notifications（按 `(user_id, raw_message_id)` 幂等）→ {id, created}。
+
+        `user_id` 是**收件人**。一条原始消息会被扇出成 N 条通知（每个订阅它的
+        用户一条），这个参数决定当前这一条是给谁的 —— 漏传就会被后端 400 挡下。
 
         evidence 为空会被后端 400 拒掉 —— 那条硬约束由后端替 bot 守着。
         """
@@ -389,17 +418,21 @@ class BackendClient:
             "POST",
             "/api/notifications",
             json=payload,
+            params=self._owner(user_id),
             purpose="notifications",
             retries=retries,
         )
         body = resp.json()
         return body if isinstance(body, dict) else {}
 
-    async def patch_notification(self, notif_id: str, payload: dict, *, retries: int | None = None) -> dict:
+    async def patch_notification(
+        self, notif_id: str, payload: dict, *, user_id: str, retries: int | None = None
+    ) -> dict:
         resp = await self._write(
             "PATCH",
             f"/api/notifications/{notif_id}",
             json=payload,
+            params=self._owner(user_id),
             purpose="notifications.patch",
             retries=retries,
         )
@@ -409,13 +442,15 @@ class BackendClient:
     async def list_notifications(
         self,
         *,
+        user_id: str,
         status: str = "all",
         q: str | None = None,
         since: int | None = None,
         limit: int = 500,
     ) -> list[dict]:
         """GET /api/notifications → 读投影列表（人工修正已生效、status 已推导）。"""
-        params: list[tuple[str, Any]] = [("status", status), ("limit", int(limit))]
+        params: list[tuple[str, Any]] = self._owner(user_id)
+        params += [("status", status), ("limit", int(limit))]
         if q:
             params.append(("q", q))
         if since is not None:
@@ -425,16 +460,22 @@ class BackendClient:
             return body.get("notifications") or []
         return body or []
 
-    async def get_notification(self, notif_id: str) -> dict:
+    async def get_notification(self, notif_id: str, *, user_id: str) -> dict:
         body = await self._json(
-            "GET", f"/api/notifications/{notif_id}", purpose="notifications.get"
+            "GET",
+            f"/api/notifications/{notif_id}",
+            params=self._owner(user_id),
+            purpose="notifications.get",
         )
         return body if isinstance(body, dict) else {}
 
-    async def delete_notification(self, notif_id: str, *, retries: int | None = None) -> dict:
+    async def delete_notification(
+        self, notif_id: str, *, user_id: str, retries: int | None = None
+    ) -> dict:
         resp = await self._write(
             "DELETE",
             f"/api/notifications/{notif_id}",
+            params=self._owner(user_id),
             purpose="notifications.delete",
             retries=retries,
         )
@@ -442,13 +483,19 @@ class BackendClient:
         return body if isinstance(body, dict) else {}
 
     async def correct_notification(
-        self, notif_id: str, *, field: str, value: object, user_id: str
+        self, notif_id: str, *, field: str, value: object, actor: str, user_id: str
     ) -> dict:
-        """POST /api/notifications/{id}/corrections —— 人工修正（只追加、留痕）。"""
+        """POST /api/notifications/{id}/corrections —— 人工修正（只追加、留痕）。
+
+        两个"用户"字段含义不同，别混：
+          - `user_id` 是**租户**（这条修正属于谁的数据）→ query 参数
+          - `actor` 是**谁操作的**（QQ 号）→ body 字段，界面上显示"谁改的"
+        """
         resp = await self._request(
             "POST",
             f"/api/notifications/{notif_id}/corrections",
-            json={"field": field, "value": value, "user_id": user_id},
+            json={"field": field, "value": value, "actor": actor},
+            params=self._owner(user_id),
             purpose="corrections",
             retries=0,  # 用户在线等
         )
@@ -458,6 +505,7 @@ class BackendClient:
     async def count_notifications(
         self,
         *,
+        user_id: str,
         status: str = "all",
         conflict: bool | None = None,
         low_confidence_below: float | None = None,
@@ -471,13 +519,14 @@ class BackendClient:
         那样数出来的是"全部通知"，会静默错得很离谱）。
         """
         if conflict is None and low_confidence_below is None:
-            params: list[tuple[str, Any]] = [("status", status), ("count_only", 1)]
+            params: list[tuple[str, Any]] = self._owner(user_id)
+            params += [("status", status), ("count_only", 1)]
             body = await self._json(
                 "GET", "/api/notifications", params=params, purpose="notifications.count"
             )
             return int((body or {}).get("count") or 0)
 
-        rows = await self.list_notifications(status=status, limit=2000)
+        rows = await self.list_notifications(user_id=user_id, status=status, limit=2000)
         if conflict is not None:
             rows = [r for r in rows if bool(r.get("conflict")) == bool(conflict)]
         if low_confidence_below is not None:
@@ -568,6 +617,7 @@ class BackendClient:
     async def create_gap_alert(
         self,
         *,
+        user_id: str,
         group_id: str,
         group_name: str | None,
         from_ts: int,
@@ -584,13 +634,17 @@ class BackendClient:
                 "to_ts": int(to_ts),
                 "reason": reason,
             },
+            params=self._owner(user_id),
             purpose="gap-alerts",
         )
         body = resp.json()
         return body if isinstance(body, dict) else {}
 
-    async def list_gap_alerts(self, *, acknowledged: bool | None = None, limit: int = 20) -> list[dict]:
-        params: list[tuple[str, Any]] = [("limit", int(limit))]
+    async def list_gap_alerts(
+        self, *, user_id: str, acknowledged: bool | None = None, limit: int = 20
+    ) -> list[dict]:
+        params: list[tuple[str, Any]] = self._owner(user_id)
+        params.append(("limit", int(limit)))
         if acknowledged is not None:
             params.append(("acknowledged", "true" if acknowledged else "false"))
         body = await self._json("GET", "/api/gap-alerts", params=params, purpose="gap-alerts")
@@ -602,17 +656,27 @@ class BackendClient:
     # 统计
     # ------------------------------------------------------------------
 
-    async def add_stats(self, day: str | None, fields: dict[str, int]) -> dict:
-        """POST /api/stats —— 后端只做累加，不理解每个字段是什么意思。"""
+    async def add_stats(self, day: str | None, fields: dict[str, int], *, user_id: str) -> dict:
+        """POST /api/stats —— 后端只做累加，不理解每个字段是什么意思。
+
+        统计是**按用户**的：一条消息被扇给 N 个人，就给这 N 个人各记一次。
+        这不是"重复计数" —— 从每个用户的角度看，"为我处理了一条消息"确实
+        发生了 N 次里的一次。全站视角的数字在运维层面没人需要，
+        而用户视角的数字（"我的源里有多少条没能解析"）才是盲区告警要用的。
+        """
         payload: dict = {"fields": {k: int(v) for k, v in fields.items() if v}}
         if day:
             payload["day"] = day
-        resp = await self._write("POST", "/api/stats", json=payload, purpose="stats")
+        resp = await self._write(
+            "POST", "/api/stats", json=payload, params=self._owner(user_id), purpose="stats"
+        )
         body = resp.json()
         return body if isinstance(body, dict) else {}
 
-    async def get_stats(self, day: str | None = None) -> dict:
-        params = [("day", day)] if day else None
+    async def get_stats(self, day: str | None = None, *, user_id: str) -> dict:
+        params: list[tuple[str, Any]] = self._owner(user_id)
+        if day:
+            params.append(("day", day))
         body = await self._json("GET", "/api/stats", params=params, purpose="stats")
         return body if isinstance(body, dict) else {}
 
@@ -623,6 +687,7 @@ class BackendClient:
     async def add_digest_log(
         self,
         *,
+        user_id: str,
         day: str | None,
         kind: str,
         text: str,
@@ -632,19 +697,27 @@ class BackendClient:
         payload: dict = {"kind": kind, "text": text, "sent": bool(sent), "error": error}
         if day:
             payload["day"] = day
-        resp = await self._write("POST", "/api/digest-log", json=payload, purpose="digest-log")
+        resp = await self._write(
+            "POST",
+            "/api/digest-log",
+            json=payload,
+            params=self._owner(user_id),
+            purpose="digest-log",
+        )
         body = resp.json()
         return body if isinstance(body, dict) else {}
 
     async def list_digest_logs(
         self,
         *,
+        user_id: str,
         day: str | None = None,
         kind: str | None = None,
         sent: bool | None = None,
         limit: int = 50,
     ) -> list[dict]:
-        params = self._digest_log_params(day=day, kind=kind, sent=sent)
+        params = self._owner(user_id)
+        params += self._digest_log_params(day=day, kind=kind, sent=sent)
         params.append(("limit", int(limit)))
         body = await self._json("GET", "/api/digest-log", params=params, purpose="digest-log")
         if isinstance(body, dict):
@@ -654,6 +727,7 @@ class BackendClient:
     async def count_digest_logs(
         self,
         *,
+        user_id: str,
         day: str | None = None,
         kind: str | None = None,
         sent: bool | None = None,
@@ -662,8 +736,12 @@ class BackendClient:
 
         digest 的"今天发过没有"必须问后端 —— bot 不允许持有跨重启存活的状态，
         而重发对收件人是骚扰，比漏发更糟。
+
+        按用户问：A 今天收到过不代表 B 收到过。混在一起会让"今天已经发过"
+        把别人的那一份也吞掉 —— 静默漏发，正是最该避免的失败。
         """
-        params = self._digest_log_params(day=day, kind=kind, sent=sent)
+        params = self._owner(user_id)
+        params += self._digest_log_params(day=day, kind=kind, sent=sent)
         params.append(("count_only", 1))
         body = await self._json(
             "GET", "/api/digest-log", params=params, purpose="digest-log.count"
@@ -693,12 +771,16 @@ class BackendClient:
         key: str,
         value: Any,
         *,
+        user_id: str,
         ttl_seconds: int | None = None,
     ) -> dict:
         """PUT /api/state/{namespace}/{key} —— 幂等 upsert。
 
         这块是"带 TTL 的持久化草稿纸"：指令的待确认状态和 /list 的编号映射
         必须跨重启存活，否则用户回 `y` 时那条待确认会凭空消失。
+
+        **也必须按用户分**：两个用户同时 /add 待确认，共用一份就会互相覆盖 ——
+        一个人确认掉的可能是另一个人的草稿。
         """
         payload: dict = {"value": value}
         if ttl_seconds is not None:
@@ -707,12 +789,13 @@ class BackendClient:
             "PUT",
             f"/api/state/{namespace}/{key}",
             json=payload,
+            params=self._owner(user_id),
             purpose=f"state.{namespace}",
         )
         body = resp.json()
         return body if isinstance(body, dict) else {}
 
-    async def get_state(self, namespace: str, key: str) -> Any | None:
+    async def get_state(self, namespace: str, key: str, *, user_id: str) -> Any | None:
         """GET /api/state/{namespace}/{key}。
 
         **404 = 没有（或已过期），不是错误** —— 这是这个接口的正常返回值之一，
@@ -722,6 +805,7 @@ class BackendClient:
             body = await self._json(
                 "GET",
                 f"/api/state/{namespace}/{key}",
+                params=self._owner(user_id),
                 purpose=f"state.{namespace}",
             )
         except BackendError as exc:
@@ -732,11 +816,12 @@ class BackendClient:
             return body.get("value")
         return None
 
-    async def delete_state(self, namespace: str, key: str) -> bool:
+    async def delete_state(self, namespace: str, key: str, *, user_id: str) -> bool:
         try:
             resp = await self._write(
                 "DELETE",
                 f"/api/state/{namespace}/{key}",
+                params=self._owner(user_id),
                 purpose=f"state.{namespace}",
             )
         except BackendError as exc:
@@ -748,13 +833,173 @@ class BackendClient:
         except Exception:
             return True
 
-    async def list_state(self, namespace: str) -> list[dict]:
+    async def list_state(self, namespace: str, *, user_id: str) -> list[dict]:
         body = await self._json(
-            "GET", f"/api/state/{namespace}", purpose=f"state.{namespace}"
+            "GET",
+            f"/api/state/{namespace}",
+            params=self._owner(user_id),
+            purpose=f"state.{namespace}",
         )
         if isinstance(body, dict):
             return body.get("items") or []
         return body or []
+
+    # ------------------------------------------------------------------
+    # 订阅与路由（契约第 12 节）
+    #
+    # 这几条是"多用户"在 bot 侧的入口：来一条消息先问"谁要"（routing），
+    # 抽一次，再按名单扇出；用户侧的 QQ 指令则直接读写订阅。
+    # ------------------------------------------------------------------
+
+    async def find_subscribers(self, group_id: str, sender_id: str | None = None) -> list[str]:
+        """GET /api/subscriptions/routing → 这条消息要扇给哪些 user_id。
+
+        bot 每处理一条消息都要问它一次。**空名单 = 没人要这条消息**，
+        那就不该花 LLM 的钱去抽它（见 runner 里的 unsubscribed 分支）。
+
+        `sender_id=None` = 这个群里任何发送者，只有缺口告警用（群级事件）。
+
+        服务令牌专属（后端会拒用户令牌）：它返回的是全局投递名单。
+        """
+        params: list[tuple[str, Any]] = [("group_id", str(group_id))]
+        if sender_id is not None:
+            params.append(("sender_id", str(sender_id)))
+        body = await self._json(
+            "GET",
+            "/api/subscriptions/routing",
+            params=params,
+            purpose="subscriptions.routing",
+        )
+        if isinstance(body, dict):
+            return [str(u) for u in (body.get("user_ids") or []) if u]
+        return []
+
+    async def list_subscriptions(
+        self, user_id: str, *, include_disabled: bool = True
+    ) -> list[dict]:
+        params = self._owner(user_id)
+        if not include_disabled:
+            params.append(("include_disabled", "false"))
+        body = await self._json(
+            "GET", "/api/subscriptions", params=params, purpose="subscriptions"
+        )
+        if isinstance(body, dict):
+            return body.get("subscriptions") or []
+        return body or []
+
+    async def add_subscription(
+        self,
+        user_id: str,
+        *,
+        group_id: str,
+        sender_id: str,
+        group_name: str | None = None,
+        sender_name: str | None = None,
+        note: str | None = None,
+    ) -> dict:
+        """POST /api/subscriptions。
+
+        `sender_id` 必填 —— 后端拒绝"订整个群"。所以这里不做任何兜底：
+        指令层必须让用户明确给出发送者，否则宁可报错。
+        """
+        payload: dict = {"group_id": str(group_id), "sender_id": str(sender_id)}
+        if group_name:
+            payload["group_name"] = group_name
+        if sender_name:
+            payload["sender_name"] = sender_name
+        if note:
+            payload["note"] = note
+        resp = await self._write(
+            "POST",
+            "/api/subscriptions",
+            json=payload,
+            params=self._owner(user_id),
+            purpose="subscriptions.add",
+            retries=0,  # 用户在线等
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def delete_subscription(self, user_id: str, sub_id: str) -> bool:
+        resp = await self._write(
+            "DELETE",
+            f"/api/subscriptions/{sub_id}",
+            params=self._owner(user_id),
+            purpose="subscriptions.delete",
+            retries=0,
+        )
+        try:
+            return bool(resp.json().get("deleted"))
+        except Exception:
+            return True
+
+    async def list_sources(self, *, keyword: str | None = None, limit: int = 200) -> list[dict]:
+        """GET /api/sources → 信息源目录（这套部署见过的 (群, 发送者)）。
+
+        给 QQ 侧的 `/订阅` 用：用户记不住群号，但认得群名和发送者名。
+        """
+        params: list[tuple[str, Any]] = [("limit", int(limit))]
+        if keyword:
+            params.append(("keyword", keyword))
+        body = await self._json("GET", "/api/sources", params=params, purpose="sources")
+        if isinstance(body, dict):
+            return body.get("sources") or []
+        return body or []
+
+    # ------------------------------------------------------------------
+    # 注册（契约第 3b 节）—— bot 只做两件事：签验证码、把码回给本人
+    # ------------------------------------------------------------------
+
+    async def request_verify_code(self, qq: str) -> dict:
+        """POST /api/verify/request → {qq, code, expires_at, ...}。
+
+        **只允许服务令牌调**，所以这一步只能由 bot 做。拿到码之后 bot 必须
+        通过 QQ 回给本人 —— 这是整条注册链路的信任基础：只有能收到那条消息的
+        人才证明得了自己拥有这个 QQ 号。前端拿不到这个接口，这是刻意的。
+        """
+        resp = await self._request(
+            "POST",
+            "/api/verify/request",
+            json={"qq": str(qq)},
+            purpose="verify.request",
+            retries=0,  # 用户在线等
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    async def list_users(self, *, limit: int = 500) -> list[dict]:
+        """GET /api/users —— 所有用户（不含令牌摘要）。服务令牌专属。
+
+        定时任务（digest / 盲区告警）需要遍历用户，而 bot 不允许自己持有
+        用户名单（那会是跨重启的状态）。
+        """
+        body = await self._json("GET", "/api/users", purpose="users")
+        if isinstance(body, dict):
+            return body.get("users") or []
+        return body or []
+
+    async def get_user_by_qq(self, qq: str) -> dict | None:
+        """GET /api/users/lookup?qq= → 用户，查不到返回 None。
+
+        这是 bot 的**身份解析**入口：QQ 号是身份锚点，`user_id` 才是数据归属。
+        404 翻译成 None（"这个人还没注册"），别的错误照抛 —— 把"没注册"
+        和"后端挂了"混成一个 None，会让用户拿到一句莫名其妙的"稍后再试"。
+        """
+        try:
+            body = await self._json(
+                "GET",
+                "/api/users/lookup",
+                params=[("qq", str(qq))],
+                purpose="users.lookup",
+            )
+        except BackendError as exc:
+            if _is_missing(exc):
+                return None
+            raise
+        if isinstance(body, dict):
+            user = body.get("user")
+            return user if isinstance(user, dict) else None
+        return None
 
     # ------------------------------------------------------------------
     # 健康

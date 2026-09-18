@@ -73,16 +73,15 @@ class Settings(BaseSettings):
     bot_listen_host: str = "127.0.0.1"
     bot_listen_port: int = 8082
     bot_api_token: str = ""
-    # 网页令牌：前端登录页用。对本服务只能调 GET /api/status 与
-    # GET /api/digest/preview —— 发消息类的接口一律 403（见 app/auth.py）。
-    # 留空 = 退回单令牌模式（管理令牌同时当网页令牌用）。
-    # 必须与 backend 的 WEB_API_TOKEN 是**同一个值**（有自检脚本守这条）。
-    web_api_token: str = ""
+    # （这里原来还有 WEB_API_TOKEN：前端登录页用的"网页令牌"，只能读状态和预览。
+    #  多用户改造后它被删掉了 —— 前端拿的是每个用户自己的 UserToken，
+    #  bot 不认识那种令牌；而 /api/status 是运营者视角，本来就不该给普通用户看。
+    #  见 app/auth.py 的说明。）
 
     # ---------------- 后端（纯数据层）----------------
     backend_base_url: str = "http://127.0.0.1:8000"
-    # 调后端时带的令牌。必须是**写入令牌**（契约里两边都叫 API_TOKEN），
-    # 网页令牌调写接口会拿到 403。见 app/auth.py。
+    # 调后端时带的令牌。必须是**服务令牌**（契约里两边都叫 API_TOKEN），
+    # 它是 bot 在后端的身份：按用户的接口还要额外显式带 user_id。
     # 所以这里不再有 INGEST_API_TOKEN 这个第二名字。
     api_token: str = ""
     backend_timeout: float = 15.0
@@ -263,13 +262,6 @@ class Settings(BaseSettings):
         **这个值不要给浏览器。**
         """
         return self.bot_api_token or self.api_token
-
-    @property
-    def web_scope_separated(self) -> bool:
-        """网页令牌与管理令牌是否**真的**分开了。配成同一个值等于没拆。"""
-        web = self.web_api_token.strip()
-        write = self.inbound_token.strip()
-        return bool(write and web and web != write)
 
     @property
     def backend_base(self) -> str:

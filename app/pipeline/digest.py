@@ -87,9 +87,17 @@ def _fmt_due(view: dict) -> str:
 
 
 async def build_digest(
-    backend: BackendClient | None = None, settings: Settings | None = None
+    backend: BackendClient | None = None,
+    settings: Settings | None = None,
+    *,
+    user_id: str,
 ) -> str:
-    """读后端 → 组装今天的 digest 文本。**不发送。**"""
+    """读后端 → 组装**某个用户**今天的 digest 文本。**不发送。**
+
+    `user_id` 必填：多用户之后"今天新增几条"是**每个人的**事。
+    以前这里读的是全站通知，现在读的是这个人的读投影（后端按 user_id 隔离），
+    所以 A 的 digest 里绝不会出现 B 订阅的来源。
+    """
     settings = settings or get_settings()
     if backend is None:
         backend = get_digest_context().backend
@@ -100,7 +108,7 @@ async def build_digest(
 
     # 一次把全部通知拉回来自己分组。MAX_LEN 只约束发出去的文本，
     # 这里多拿一些是为了让"今天新增"和"24 小时内到期"两份清单都准。
-    views = await backend.list_notifications(status="all", limit=2000)
+    views = await backend.list_notifications(user_id=user_id, status="all", limit=2000)
 
     fresh = [
         v for v in views
@@ -142,15 +150,17 @@ async def build_digest(
             lines.append(f"· {v.get('title')} — {_fmt_due(v)}")
 
     # ---------------- 盲区 ----------------
+    # 盲区也是**按用户**的：只有这个人的源里没解析出来的才算他的盲区。
+    # 后端按 user_id 过滤，所以这里拿到的就是"我的源今天出过什么问题"。
     try:
-        stat = await backend.get_stats(today)
+        stat = await backend.get_stats(today, user_id=user_id)
     except BackendError as exc:
-        logger.warning("读统计失败：%s", exc)
+        logger.warning("读统计失败 user=%s：%s", user_id, exc)
         stat = {}
     try:
-        gaps = await backend.list_gap_alerts(limit=5)
+        gaps = await backend.list_gap_alerts(user_id=user_id, limit=5)
     except BackendError as exc:
-        logger.warning("读缺口告警失败：%s", exc)
+        logger.warning("读缺口告警失败 user=%s：%s", user_id, exc)
         gaps = []
 
     unparsed = int(stat.get("unparsed") or 0)
@@ -204,14 +214,86 @@ async def _send_private(sender: Any, target: str, text: str) -> tuple[bool, str 
     return True, None
 
 
+async def resolve_recipients(
+    backend: BackendClient, settings: Settings | None = None
+) -> list[tuple[str, str]]:
+    """定出这次 digest 该发给谁，返回 `[(qq, user_id)]`。
+
+    两种模式：
+
+      - **默认（多用户）**：所有 active 的注册用户，各发一份**自己那份**。
+        digest 是"你的 DDL"，不是"全站的 DDL"，所以文本也是各人各组装。
+      - **`DIGEST_TARGET_QQ` 配了**：只发那一个 QQ。这是给"实际上就一个人用"
+        或者迁移期用的，行为和这个字段在单租户时代完全一样。
+
+    收件人必须是**注册用户**：digest 的正文来自那个人的通知，没有账号就没有
+    可组装的正文。以前 `DIGEST_TARGET_QQ` 可以是任意 QQ（发的是全站摘要），
+    现在不行了 —— 这种情况会记 ERROR 而不是安静地不发。
+    """
+    settings = settings or get_settings()
+    target = (settings.digest_target_qq or "").strip()
+
+    if target:
+        user = await backend.get_user_by_qq(target)
+        if not user:
+            logger.error(
+                "DIGEST_TARGET_QQ=%s 不是一个注册用户，digest 发不出去。"
+                "多用户之后 digest 是按人组装的，收件人必须先注册（或把这个配置留空）",
+                target,
+            )
+            return []
+        return [(target, str(user.get("id") or ""))]
+
+    users = await backend.list_users()
+    out: list[tuple[str, str]] = []
+    for user in users:
+        qq = str(user.get("qq") or "").strip()
+        uid = str(user.get("id") or "").strip()
+        status = str(user.get("status") or "active")
+        if not qq or not uid:
+            continue
+        if status != "active":
+            # 被停用的账号不发：发出去也没有意义，而且会让人以为账号还在用
+            continue
+        out.append((qq, uid))
+    return out
+
+
+def _empty_result(error: str, *, dry_run: bool) -> dict:
+    """一条都没发出去时的返回值。
+
+    **形状必须和成功路径完全一致**（ok/sent/total/dry_run/text/recipients/error）。
+    少一个键，调用方（网页上的预览按钮、自动发送循环）就会在"没人可发"这条
+    路径上抛 KeyError —— 而那正好是最需要它好好报错的时候。
+    """
+    return {
+        "ok": False,
+        "sent": 0,
+        "total": 0,
+        "dry_run": bool(dry_run),
+        "text": "",
+        "recipients": [],
+        "error": error,
+    }
+
+
 async def send_digest(
     dry_run: bool = True,
     kind: str = "manual",
     *,
+    user_id: str | None = None,
+    qq: str | None = None,
     backend: BackendClient | None = None,
     sender: Any | None = None,
 ) -> dict:
-    """组装并（可选）发送 digest。返回值即 `POST /api/digest/send` 的响应体。"""
+    """组装并（可选）发送 digest。返回值即 `POST /api/digest/send` 的响应体。
+
+    不指定收件人时按 `resolve_recipients` 逐个发。指定了（`user_id` + `qq`）
+    就只发那一个 —— 单用户部署和排查用得上。
+
+    `dry_run=True` 时只组装不发，但**仍然写一条 preview 记录**：
+    "预览过什么" 也是需要能回看的事实。
+    """
     settings = get_settings()
     if backend is None or sender is None:
         ctx = get_digest_context()
@@ -219,33 +301,80 @@ async def send_digest(
         sender = sender or ctx.sender
 
     today = local_day()
-    try:
-        text = await build_digest(backend, settings)
-    except BackendError as exc:
-        # 读不到通知就先不发 —— 发一条"新增 0 条"的空 digest 比不发更误导人
-        error = f"读取通知失败：{exc}"
-        await _log_digest(backend, today, kind, "", sent=False, error=error)
-        return {"ok": False, "sent": False, "text": "", "error": error}
 
-    if dry_run:
-        await _log_digest(backend, today, "preview", text, sent=False, error=None)
-        return {"ok": True, "sent": False, "text": text, "error": None}
-
-    error: str | None = None
-    if not settings.digest_target_qq:
-        error = "未配置 DIGEST_TARGET_QQ，无法发送"
-        sent = False
+    if user_id and qq:
+        targets: list[tuple[str, str]] = [(qq, user_id)]
+    elif user_id:
+        # 从用户表把这个人的 QQ 找回来，省得调用方自己拼
+        users = await backend.list_users()
+        match = [str(u.get("qq") or "") for u in users if str(u.get("id") or "") == user_id]
+        if not match or not match[0]:
+            error = f"找不到 user_id={user_id} 对应的 QQ"
+            logger.warning("digest 未发送：%s", error)
+            return _empty_result(error, dry_run=dry_run)
+        targets = [(match[0], user_id)]
     else:
-        sent, error = await _send_private(sender, settings.digest_target_qq, text)
+        try:
+            targets = await resolve_recipients(backend, settings)
+        except BackendError as exc:
+            error = f"读取收件人失败：{exc}"
+            logger.warning(error)
+            return _empty_result(error, dry_run=dry_run)
+
+    if not targets:
+        error = "没有可发送的收件人（还没有注册用户，或 DIGEST_TARGET_QQ 不是注册用户）"
+        logger.warning("digest 未发送：%s", error)
+        return _empty_result(error, dry_run=dry_run)
+
+    results: list[dict] = []
+    for target_qq, target_uid in targets:
+        try:
+            text = await build_digest(backend, settings, user_id=target_uid)
+        except BackendError as exc:
+            # 读不到通知就先不发 —— 发一条"新增 0 条"的空 digest 比不发更误导人
+            error = f"读取通知失败：{exc}"
+            await _log_digest(backend, target_uid, today, kind, "", sent=False, error=error)
+            results.append({"qq": target_qq, "user_id": target_uid, "sent": False, "error": error})
+            continue
+
+        if dry_run:
+            await _log_digest(backend, target_uid, today, "preview", text, sent=False, error=None)
+            results.append({"qq": target_qq, "user_id": target_uid, "sent": False, "text": text, "error": None})
+            continue
+
+        sent, error = await _send_private(sender, target_qq, text)
         if not sent and not error:
             error = "发送失败，但没有给出原因"
+        await _log_digest(backend, target_uid, today, kind, text, sent=sent, error=error)
+        if not sent:
+            # 发不出去最常见的原因是"对方不是机器人的好友"：QQ 机器人**不能**
+            # 主动给陌生人发消息。这条日志是唯一能让人看出原因的线索。
+            logger.warning(
+                "digest 发不出去 qq=%s user=%s：%s（QQ 机器人只能给好友或临时会话发消息）",
+                target_qq,
+                target_uid,
+                error,
+            )
+        results.append({"qq": target_qq, "user_id": target_uid, "sent": sent, "text": text, "error": error})
 
-    await _log_digest(backend, today, kind, text, sent=sent, error=error)
-    return {"ok": bool(sent), "sent": bool(sent), "text": text, "error": error}
+    sent_count = sum(1 for r in results if r["sent"])
+    failed = [r for r in results if not r["sent"]] if not dry_run else []
+    return {
+        "ok": (sent_count == len(results)) if not dry_run else True,
+        "sent": sent_count,
+        "total": len(results),
+        "dry_run": bool(dry_run),
+        # 文本只回第一份：它是"这一批长什么样"的样本，逐份回会在管理页上刷屏。
+        # 每份都写进了 digest_log，要核对细节看那里。
+        "text": (results[0].get("text") or "") if results else "",
+        "recipients": [{k: v for k, v in r.items() if k != "text"} for r in results],
+        "error": (failed[0].get("error") if failed else None),
+    }
 
 
 async def _log_digest(
     backend: BackendClient,
+    user_id: str,
     day: str,
     kind: str,
     text: str,
@@ -258,9 +387,11 @@ async def _log_digest(
     写失败也**不抛**：发送本身已经发生了，日志是附属品。
     """
     try:
-        await backend.add_digest_log(day=day, kind=kind, text=text, sent=sent, error=error)
+        await backend.add_digest_log(
+            user_id=user_id, day=day, kind=kind, text=text, sent=sent, error=error
+        )
     except BackendError as exc:
-        logger.warning("写 digest_log 失败（day=%s kind=%s）：%s", day, kind, exc)
+        logger.warning("写 digest_log 失败（user=%s day=%s kind=%s）：%s", user_id, day, kind, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -268,25 +399,36 @@ async def _log_digest(
 # ---------------------------------------------------------------------------
 
 
-async def sent_today(backend: BackendClient, day: str | None = None) -> bool:
-    """今天自动 digest 是否已经发成功过（问后端，不问内存）。"""
+async def sent_today(backend: BackendClient, user_id: str, day: str | None = None) -> bool:
+    """**这个用户**今天自动 digest 是否已经发成功过（问后端，不问内存）。
+
+    必须按用户问：A 收到过不代表 B 收到过。混成一个"今天发过了"的标记，
+    会让第二个人的那份被静默吞掉 —— 而"没收到"过很久才会被发现。
+    """
     try:
-        return await backend.count_digest_logs(day=day or local_day(), kind="auto", sent=True) > 0
+        return (
+            await backend.count_digest_logs(
+                user_id=user_id, day=day or local_day(), kind="auto", sent=True
+            )
+            > 0
+        )
     except BackendError as exc:
-        logger.warning("查询 digest 发送记录失败，保守判定为未发送：%s", exc)
+        logger.warning("查询 digest 发送记录失败（user=%s），保守判定为未发送：%s", user_id, exc)
         return False
 
 
-async def auto_attempts_today(backend: BackendClient, day: str | None = None) -> int:
+async def auto_attempts_today(backend: BackendClient, user_id: str, day: str | None = None) -> int:
     try:
-        return await backend.count_digest_logs(day=day or local_day(), kind="auto")
+        return await backend.count_digest_logs(
+            user_id=user_id, day=day or local_day(), kind="auto"
+        )
     except BackendError as exc:
-        logger.warning("查询 digest 尝试次数失败：%s", exc)
+        logger.warning("查询 digest 尝试次数失败（user=%s）：%s", user_id, exc)
         return 0
 
 
 async def digest_loop() -> None:
-    """每分钟检查一次是否到了发送时间。"""
+    """每分钟检查一次是否到了发送时间，到点了给**每个还没收到的用户**发。"""
     settings = get_settings()
     if not settings.digest_enabled:
         logger.info("每日 digest 未启用")
@@ -303,22 +445,45 @@ async def digest_loop() -> None:
             now = to_local(now_ms())
             today = local_day()
             if now and (now.hour, now.minute) >= (hh, mm):
-                if not await sent_today(backend, today):
-                    attempts = await auto_attempts_today(backend, today)
-                    if attempts >= max_attempts:
+                try:
+                    targets = await resolve_recipients(backend, settings)
+                except BackendError as exc:
+                    logger.warning("取 digest 收件人失败，本轮跳过：%s", exc)
+                    targets = []
+
+                # 逐个用户判断"这个人今天发过没有"：先发的先成功，
+                # 后面失败的下一分钟还会被捡起来，不会因为别人成功而被跳过。
+                pending: list[tuple[str, str]] = []
+                for target_qq, target_uid in targets:
+                    if not await sent_today(backend, target_uid, today):
+                        pending.append((target_qq, target_uid))
+
+                if pending:
+                    already = await auto_attempts_today(backend, pending[0][1], today)
+                    if already >= max_attempts:
                         if not warned:
                             warned = True
                             logger.error(
-                                "每日 digest 今日已失败 %d 次，不再重试；"
-                                "请检查 DIGEST_TARGET_QQ、OneBot 连接与后端 digest_log",
-                                attempts,
+                                "每日 digest 对部分用户今日已失败 %d 次，不再重试；"
+                                "请检查 OneBot 连接、对方是否是机器人好友，以及后端 digest_log",
+                                already,
                             )
                     else:
-                        result = await send_digest(dry_run=False, kind="auto")
-                        if result["sent"]:
-                            logger.info("每日 digest 已发送")
-                        else:
-                            logger.warning("每日 digest 发送失败：%s", result.get("error"))
+                        for target_qq, target_uid in pending:
+                            result = await send_digest(
+                                dry_run=False,
+                                kind="auto",
+                                user_id=target_uid,
+                                qq=target_qq,
+                            )
+                            if result.get("sent"):
+                                logger.info("每日 digest 已发送 user=%s", target_uid)
+                            else:
+                                logger.warning(
+                                    "每日 digest 发送失败 user=%s：%s",
+                                    target_uid,
+                                    result.get("error"),
+                                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
