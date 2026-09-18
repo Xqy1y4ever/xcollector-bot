@@ -39,6 +39,7 @@ from __future__ import annotations
 import base64
 import logging
 import mimetypes
+import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -52,7 +53,7 @@ from ..onebot.segments import parse_message
 from ..utils import local_day, now_ms
 from .extract import extract_with_llm
 from .rule_extract import rule_extract
-from .trace import fmt_due, log_message, message_meta
+from .trace import elapsed_ms, fmt_due, log_message, log_stage, message_meta
 
 logger = logging.getLogger(__name__)
 
@@ -521,25 +522,30 @@ async def write_ahead(
 
     # 写前日志：attachments 先留空，稍后 PATCH 回填（契约第 1 节）
     payload = build_message_payload(doc, [])
+    started = time.monotonic()
     try:
         body = await backend.create_message(payload)
     except BackendError as exc:
         backend.mark_for_retry(message=doc, note=f"写前日志失败：{exc}")
+        log_stage("入库", doc, 结果="失败，已进待重试队列", 原因=str(exc), 耗时=elapsed_ms(started))
         log_message(doc, "error", 原因=f"写前日志失败：{exc}")
         return WriteAhead(outcome="error", doc=doc)
 
     raw_id = str(body.get("id") or "")
     if not raw_id:
         backend.mark_for_retry(message=doc, note="后端没有返回 id")
+        log_stage("入库", doc, 结果="失败：后端没返回 id", 耗时=elapsed_ms(started))
         log_message(doc, "error", 原因="后端没有返回 id")
         return WriteAhead(outcome="error", doc=doc)
 
     is_new = bool(body.get("is_new", True))
     if not is_new and not retry:
         # 幂等命中：同一条消息被推了两次（NapCat 重连时很常见）
+        log_stage("入库", doc, 结果="幂等命中（这条之前已经存过）", raw_id=raw_id, 耗时=elapsed_ms(started))
         log_message(message_meta(doc), "duplicate", raw_id=raw_id)
         return WriteAhead(outcome="duplicate", raw_id=raw_id, is_new=False, doc=doc)
 
+    log_stage("入库", doc, 结果="原文已落库", raw_id=raw_id, 耗时=elapsed_ms(started))
     return WriteAhead(outcome="ok", raw_id=raw_id, is_new=is_new, doc=doc)
 
 
@@ -571,7 +577,17 @@ async def finish_message(
     if skipped_attachments:
         prep = PreparedAttachments(payload=list(doc.get("attachments") or []))
     else:
+        started = time.monotonic()
         prep = await prepare_attachments(doc, backend, settings)
+        if doc.get("attachments"):
+            # 只在这条消息**本来有**附件时才打：没有附件的消息不该多一行噪音
+            log_stage(
+                "附件",
+                doc,
+                已存=len(prep.payload),
+                失败=len(doc.get("attachments") or []) - len(prep.payload) or None,
+                耗时=elapsed_ms(started),
+            )
         if prep.payload:
             # 只在真有附件时才多打一次 PATCH：写前日志已经存了 `attachments: []`，
             # 没有附件就没有要补的东西
@@ -635,7 +651,17 @@ async def process_raw(
             return "skipped_whitelist"
 
         # ---- 抽取 ----
+        started = time.monotonic()
         result, degraded, tokens = await parse_content(doc, settings, images)
+        log_stage(
+            "抽取",
+            doc,
+            抽取器=settings.extractor,
+            模型=(result or {}).get("model") if result else None,
+            tokens=tokens or None,
+            降级="是" if degraded else None,
+            耗时=elapsed_ms(started),
+        )
 
         if result is None:
             if degraded:

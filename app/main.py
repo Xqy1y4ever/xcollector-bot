@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from typing import Annotated
@@ -45,6 +46,7 @@ from .pipeline.runner import (
     resume_pending,
     write_ahead,
 )
+from .pipeline.trace import elapsed_ms, log_received, log_stage
 from .pipeline.watchdog import silence_loop, startup_gap_check
 from .utils import local_day, now_ms, truncate
 
@@ -434,9 +436,33 @@ class BotRuntime:
         """OneBot 事件总入口。"""
         kind = message_kind(event)
         if kind == "group":
+            # **先留痕，再干活。** 归一化要查群名（一次网络往返），后面还有附件
+            # 下载和模型调用，加起来可能几十秒。如果只在处理完之后打日志，
+            # 一条卡住的消息在日志里完全看不到 —— 而这条链路最怕的就是静默。
+            #
+            # 群不在白名单的降到 DEBUG：那类消息量大且重复，INFO 会把日志刷爆，
+            # 而且它们的结局（group_filtered）本来也只值 DEBUG。两边级别一致，
+            # 才不会出现"只有收到、没有下文"的困惑行。
+            in_group = self.settings.in_group_whitelist(event.get("group_id"))
+            log_received(
+                event,
+                level=logging.INFO if in_group else logging.DEBUG,
+                # 用内存里的群名缓存，**不查网络** —— 这行必须在处理之前打出来
+                group_name=self.normalizer.groups.name(str(event.get("group_id") or "")),
+            )
+
+            started = time.monotonic()
             msg = await self.normalizer.normalize(event, self.hub)
             if msg is None:
+                log_stage("归一化", {"message_id": event.get("message_id")}, 结果="已忽略（自己发的/无法解析）")
                 return
+            log_stage(
+                "归一化",
+                {"message_id": msg.message_id},
+                附件=len(msg.attachments or []) or None,
+                合并转发="是" if "[合并转发]" in (msg.text or "") else None,
+                耗时=elapsed_ms(started),
+            )
             await self.pipeline.submit(msg)
         elif kind == "private":
             await self.router.handle_private_event(event)

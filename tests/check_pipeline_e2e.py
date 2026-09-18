@@ -19,7 +19,9 @@ ONEBOT_WS_URL（runtime.start() 从没被调用过）。
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import re
 import socket
 import sys
 from contextlib import nullcontext
@@ -257,6 +259,42 @@ class RecordingHub(FakeHub):
         return {"status": "ok", "retcode": 0}
 
 
+class LogCapture(logging.Handler):
+    """抓 `xcollector.message` 的日志行，用来断言处理轨迹的**顺序与内容**。
+
+    日志是给人看的，但它也是排障的唯一线索 —— "收到"那行必须在处理之前就出现，
+    否则一条卡在附件下载或模型调用上的消息在日志里什么都看不到。
+    这条不变式只有真跑一遍才验得出来，所以在这里把它钉住。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(record.getMessage())
+
+    def stages(self) -> list[str]:
+        """按顺序取出 `阶段=X` / `结果=X` 里的 X。"""
+        out: list[str] = []
+        for line in self.lines:
+            m = re.match(r"(?:阶段|结果)=(\S+)", line)
+            if m:
+                out.append(m.group(1))
+        return out
+
+    def find(self, needle: str) -> str:
+        return next((line for line in self.lines if needle in line), "")
+
+    def __enter__(self) -> LogCapture:
+        self._logger = logging.getLogger("xcollector.message")
+        self._logger.addHandler(self)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._logger.removeHandler(self)
+
+
 async def wait_for(predicate, timeout: float = 10.0) -> bool:
     waited = 0.0
     while waited < timeout:
@@ -315,12 +353,39 @@ async def test_group_message_flow(port: int) -> None:
             text=" 大家下周三前把军训心得交到班长那里，不少于800字。",
             image_url=f"http://127.0.0.1:{port}/api/_fake/blob/x.png",
         )
-        await runtime.handle_event(event)
-        # 通知建出来之后还有 PATCH(state) 和 POST(/api/stats)，要等整条链路走完
-        done = await wait_for(
-            lambda: bool(fake_backend.STATE.notifications) and bool(fake_backend.STATE.stats)
-        )
+        with LogCapture() as logs:
+            await runtime.handle_event(event)
+            # 通知建出来之后还有 PATCH(state) 和 POST(/api/stats)，要等整条链路走完
+            done = await wait_for(
+                lambda: bool(fake_backend.STATE.notifications) and bool(fake_backend.STATE.stats)
+            )
         check_true("通知已建出来", done)
+
+        # ---- 处理轨迹：先"收到"，再一步步往下 ----
+        stages = logs.stages()
+        check(
+            "轨迹顺序：收到 → 归一化 → 入库 → 附件 → 抽取",
+            stages[:5],
+            ["收到", "归一化", "入库", "附件", "抽取"],
+        )
+        check("轨迹以汇总行结尾", stages[-1] if stages else "", "extracted")
+
+        received = logs.find("阶段=收到")
+        check_true("「收到」那行带群号和发送者", "123456789" in received and "张老师" in received, received)
+        check_true(
+            "「收到」那行直接带原文（还没归一化就能看出是什么消息）",
+            "军训心得" in received,
+            received,
+        )
+        check_true(
+            "「收到」在「入库」之前 —— 卡住的消息也留得下痕迹",
+            logs.lines.index(received) < logs.lines.index(logs.find("阶段=入库")),
+        )
+        check_true("阶段行都带 msg_id，便于 grep 一条消息", "msg_id=12345" in logs.find("阶段=抽取"))
+        check_true(
+            "阶段行都带耗时，能看出慢在哪一步",
+            "耗时=" in logs.find("阶段=入库") and "耗时=" in logs.find("阶段=抽取"),
+        )
 
         seq = sequence_since(mk)
         print("    真实调用序列：")

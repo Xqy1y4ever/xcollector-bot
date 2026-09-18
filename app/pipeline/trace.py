@@ -1,18 +1,25 @@
-"""每条消息一行结构化日志。
+"""每条消息的处理轨迹：**先留痕，再干活**，最后一行汇总。
 
-系统的第一条原则是「绝不静默丢弃」，但光有数据库和盲区计数还不够 ——
-排障时要能直接在日志里看到"这条消息进来之后到底发生了什么"。
+排障时要能直接在日志里看到"这条消息进来之后到底发生了什么"，所以一条消息会产生：
 
-所以每条被处理的消息都**恰好产生一行** key=value 记录，便于 grep：
+    阶段=收到   | 群=… | 发送者=… | msg_id=… | 发送时间=… | 原文=…
+    阶段=归一化 | msg_id=… | 附件=2 | 耗时=12ms
+    阶段=入库   | msg_id=… | raw_id=… | 幂等=新 | 耗时=48ms
+    阶段=附件   | msg_id=… | 已存=2 失败=0 | 耗时=340ms
+    阶段=抽取   | msg_id=… | 抽取器=llm | 模型=… | tokens=812 | 耗时=1203ms
+    结果=extracted | 群=… | 标题=… | 截止=… | …（最后一行的汇总）
 
-    结果=extracted | 群=示例通知群(123456) | 发送者=张老师 | msg_id=12345 |
-    发送时间=09-16 19:40:12 | 标题=提交军训心得 | 截止=09-23 23:59(下周三前) |
-    置信度=0.7 | 抽取器=llm | 模型=deepseek/deepseek-chat | 附件=1 | 原文=大家下周三前…
+`阶段=` 和 `结果=` 都是固定前缀，`grep '阶段='` 看轨迹、`grep '结果='` 看结论。
+
+**为什么"收到"必须排在最前面**：归一化要查群名（一次网络往返），附件要下载上传，
+抽取要调模型 —— 这些加起来可能几十秒。如果只在处理完之后打一行，一条卡住的消息
+在日志里就完全看不到，"到底收到没有"只能靠猜；而这条链路最怕的就是静默。
 
 日志级别约定（`LOG_LEVEL` 默认 INFO）：
-  - INFO    ：正常路径 —— extracted / noise / skipped_whitelist
+  - INFO    ：正常路径 —— 收到（群在白名单内）/ 各阶段 / extracted / noise /
+              skipped_whitelist
   - WARNING ：值得注意 —— unparsed（本该抽出却没抽出）/ degraded / error
-  - DEBUG   ：量大且重复 —— group_filtered（群白名单外）/ duplicate（重复推送）
+  - DEBUG   ：量大且重复 —— 收到（群**不**在白名单内）/ group_filtered / duplicate
 """
 
 from __future__ import annotations
@@ -30,6 +37,21 @@ _WARN_OUTCOMES = {"unparsed", "degraded", "error"}
 
 # 这些结果只值 DEBUG，否则会淹没日志
 _DEBUG_OUTCOMES = {"group_filtered", "duplicate"}
+
+# OneBot 消息段类型 → 日志里的一小段可读文本。
+# 只映射"看了就知道是什么"的几种，其余按 [类型] 兜底。
+_SEGMENT_LABELS = {
+    "image": "[图片]",
+    "face": "[表情]",
+    "record": "[语音]",
+    "video": "[视频]",
+    "file": "[文件]",
+    "forward": "[合并转发]",
+    "json": "[卡片]",
+    "xml": "[卡片]",
+    "reply": "[回复]",
+    "poke": "[戳一戳]",
+}
 
 
 def one_line(text: Any, limit: int | None = None) -> str:
@@ -140,3 +162,115 @@ def describe_attachment_count(raw: Mapping[str, Any]) -> int:
         return len(data or [])
     except Exception:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# 处理轨迹：收到 + 各阶段
+# ---------------------------------------------------------------------------
+
+
+def _fmt_event_ts(seconds: Any) -> str:
+    """OneBot 事件的 `time` 是**秒**，这里统一成和别处一样的本地时间显示。"""
+    try:
+        dt = to_local(int(seconds) * 1000)
+    except (TypeError, ValueError):
+        dt = None
+    return dt.strftime("%m-%d %H:%M:%S") if dt else "?"
+
+
+def event_preview(event: Mapping[str, Any]) -> str:
+    """从**原始 OneBot 事件**里抠出一段可读正文。
+
+    不能等归一化之后再打：归一化要先查群名（一次网络往返），而"收到"这行的
+    意义恰恰是**在处理之前就留下痕迹**。所以这里只做最轻的解析。
+    """
+    msg = event.get("message")
+    if isinstance(msg, str):
+        text = msg  # CQ 码字符串形式
+    elif isinstance(msg, list):
+        bits: list[str] = []
+        for seg in msg:
+            if not isinstance(seg, dict):
+                continue
+            kind = str(seg.get("type") or "")
+            data = seg.get("data") or {}
+            if kind == "text":
+                bits.append(str(data.get("text") or ""))
+            elif kind == "at":
+                qq = str(data.get("qq"))
+                bits.append("@全体成员" if qq == "all" else f"@{qq}")
+            else:
+                bits.append(_SEGMENT_LABELS.get(kind, f"[{kind or '未知'}]"))
+        text = "".join(bits)
+    else:
+        text = str(event.get("raw_message") or "")
+    return one_line(text) or "(无正文)"
+
+
+def log_received(
+    event: Mapping[str, Any],
+    *,
+    level: int = logging.INFO,
+    group_name: str | None = None,
+) -> str:
+    """**收到消息的第一行日志**，在处理之前打。
+
+    群不在白名单时调用方会传 DEBUG —— 那类消息量大且重复，INFO 会把日志刷爆，
+    而且它们的结局（group_filtered）本来也只值 DEBUG。两边的级别保持一致，
+    才不会出现"只有收到、没有下文"的困惑行。
+
+    `group_name` 传得进来就带上（调用方手里的群名缓存，**不查网络**）。
+    查不到就只显示群号 —— 这行的意义是快，不是全。
+    """
+    sender = event.get("sender") or {}
+    who = sender.get("card") or sender.get("nickname") or event.get("user_id")
+    group_id = event.get("group_id")
+    group = f"{group_name}({group_id})" if group_name else str(group_id)
+    line = " | ".join(
+        [
+            "阶段=收到",
+            f"群={group}",
+            f"发送者={who}({event.get('user_id')})",
+            f"msg_id={event.get('message_id')}",
+            f"发送时间={_fmt_event_ts(event.get('time'))}",
+            f"原文={event_preview(event)}",
+        ]
+    )
+    logger.log(level, line)
+    return line
+
+
+def log_stage(
+    stage: str,
+    message: Mapping[str, Any] | None = None,
+    *,
+    level: int = logging.INFO,
+    **extra: Any,
+) -> str:
+    """处理过程中的一步。
+
+    格式与汇总行一致（`键=值 | 键=值`），开头固定是 `阶段=`，
+    所以 `grep '阶段='` 能看到一条消息的完整轨迹。
+    """
+    parts = [f"阶段={stage}"]
+    if message is not None:
+        parts.append(f"msg_id={message.get('message_id')}")
+    for key, value in extra.items():
+        if value is None or value == "":
+            continue
+        parts.append(f"{key}={value}")
+    line = " | ".join(parts)
+    logger.log(level, line)
+    return line
+
+
+def elapsed_ms(started: float) -> str:
+    """把 `time.monotonic()` 的起点换算成 `123ms` / `1.2s`。
+
+    阶段日志里带耗时的意义：出问题时一眼能看出慢在哪一步 ——
+    是查群名卡住了、附件下载卡住了，还是模型调用卡住了。
+    """
+    import time
+
+    ms = (time.monotonic() - started) * 1000.0
+    return f"{ms:.0f}ms" if ms < 1000 else f"{ms / 1000:.1f}s"
