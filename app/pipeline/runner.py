@@ -45,7 +45,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import httpx
 
-from ..backend_client import BackendClient, BackendError
+from ..backend_client import BackendClient, BackendError, BackendRejected
 from ..config import Settings, get_settings
 from ..llm.target import target_from_settings
 from ..normalize import attachments_payload

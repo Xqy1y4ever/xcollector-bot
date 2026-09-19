@@ -2,10 +2,12 @@
 
     .\\venv\\Scripts\\python.exe -m tests.check_extract
 
-⚠️ 这份文件是从 xcollector-client/tests/check_extract.py **抄过来的**（去掉那里的
-isolate_settings()，并把 merge 函数换成 runner 里那个名字）。两个仓库必须用同一套
-判据与同一张日历 —— 同一条通知从实时链路（bot）和从聊天记录库（client）进来，
-结果不能不一样。改一边就要改另一边。
+⚠️ 这份文件是从 xcollector-client/tests/check_extract.py **抄过来的**，只改了两处：
+去掉那里的 isolate_settings()；把"真的走一遍抽取链路"的适配函数换成 
+unner.parse_content
+（并且 acompletion 的打桩点换成 pp.llm 包上的属性，因为 bot 的 extract 是延迟导入的）。
+两个仓库必须用同一套判据与同一张日历 —— 同一条消息从实时链路（bot）和从聊天记录库
+（client）进来，结果不能不一样。改一边就要改另一边。
 
 ## 这个文件守的是什么
 
@@ -18,15 +20,20 @@ isolate_settings()，并把 merge 函数换成 runner 里那个名字）。两�
    对模型不是。所以：给模型的提示里直接放一张算好的日历，同时留一条确定性的兜底
    （ill_due_from_rule：模型没给时间、规则算出来了，就用规则的，并且标清来源）。
 
-这份文件**不联网、不调用模型**：只验"我们交给模型的东西"和"模型回来之后我们怎么处理"。
+第 7 节会**真的走一遍"拼提示词 → 调模型 → 合并规则"**（只把网络层换成假的）：
+曾经这里漏改过一个函数名，导致每次模型调用都 NameError、被吞成"降级为规则抽取"，
+而当时所有自检都是绿的。这一节就是为了让那种错再也出不去。
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 from datetime import datetime
 
-from app.config import get_settings
+import app.llm as llm_pkg
+from app.config import Settings, get_settings
 from app.pipeline.extract import (
     LLMNotification,
     PROMPT_VER,
@@ -35,8 +42,8 @@ from app.pipeline.extract import (
     finalize,
     render_system_prompt,
 )
-from app.pipeline.runner import _merge_rule_disagreement as merge_rule_disagreement
 from app.pipeline.rule_extract import rule_extract
+from app.pipeline.runner import _merge_rule_disagreement as merge_rule_disagreement
 from app.pipeline.timeparse import parse_due
 
 TZ = get_settings().tz
@@ -59,6 +66,33 @@ def check(name: str, got, want) -> None:
 
 def check_true(name: str, cond: bool, detail: str = "") -> None:
     check(name + (f"  {detail}" if detail else ""), bool(cond), True)
+
+
+def run_llm_path(text: str, ts_ms: int):
+    """把这条消息**真的**走一遍抽取链路（
+unner.parse_content），网络层由调用方换掉。
+
+    ⚠️ 两个仓库唯一不同的地方就是这一小段：client 那边走的是 process.extract。
+    其余断言两边逐字一致。
+    """
+    from app.pipeline.runner import parse_content
+
+    raw = {
+        "content": text,
+        "ts": ts_ms,
+        "message_id": "m1",
+        "group_id": "g1",
+        "sender_id": "s1",
+        "sender_name": "老师",
+        "at_all": False,
+    }
+    settings = Settings(
+        extractor="both",
+        llm_primary_provider="deepseek",
+        llm_primary_model="fake-model",
+        deepseek_api_key="fake-key",
+    )
+    return asyncio.run(parse_content(raw, settings, []))
 
 
 def main() -> int:  # noqa: C901
@@ -214,6 +248,69 @@ def main() -> int:  # noqa: C901
     check("比消息还早一个月的时间被丢掉（不许当真）", bad["due_at"], None)
     check("把握归零", bad["due_confidence"], 0.0)
     check("due_text 留着给人看", bad["due_text"], "8月1日")
+
+    # ------------------------------------------------------------------
+    print("\n--- 7. 真的走一遍「拼提示词 → 调模型 → 合并规则」这条路（网络层换成假的）---")
+    # 为什么必须有这一节：上面全是纯函数，而真正会坏的是**拼提示词 + 调模型**这一段。
+    # 现实教训：`build_system_prompt` 改名成 `render_system_prompt` 之后，`_call_model`
+    # 里的调用处没跟着改 —— 每次模型调用都变成 `NameError`，被上层吞成
+    # "降级为规则抽取"，而**所有自检都是绿的**（没有任何测试真的调用过这条路）。
+    llm_calls: list[dict] = []
+    reply = {
+        "is_notification": True,
+        "reason": "",
+        "title": "提交军训心得",
+        "summary": "下周三前把军训心得交给班长。",
+        "location": None,
+        "due_at": None,           # ← 故意不给时间：看规则兜底接不接得住
+        "due_text": "下周三前",
+        "due_confidence": 0.0,
+        "evidence": "大家下周三前把军训心得交到班长那里",
+    }
+
+    class _FakeCompletion:
+        total_tokens = 7
+
+        def __init__(self, payload: dict):
+            # 必须**每次调用时**再序列化：写成类属性的话，第一次求值之后就被冻住了，
+            # 后面改 `reply` 不会生效（第一版就踩了这个坑：第二个用例拿到的还是第一个的回答）。
+            self.text = json.dumps(payload, ensure_ascii=False)
+
+    async def _fake_acompletion(**kwargs):
+        llm_calls.append(kwargs)
+        return _FakeCompletion(reply)
+
+    original = llm_pkg.acompletion
+    try:
+        llm_pkg.acompletion = _fake_acompletion
+        result, degraded, tokens = run_llm_path("大家下周三前把军训心得交到班长那里", ANCHOR)
+    finally:
+        llm_pkg.acompletion = original
+
+    check("这条路跑通了（没有降级）", degraded, False)
+    check("调了 1 次模型", len(llm_calls), 1)
+    check_true("拿回的是模型的结果", result is not None and result["title"] == "提交军训心得", str(result))
+    check("token 数带回来了", tokens, 7)
+    system = llm_calls[0]["messages"][0]["content"]
+    check_true("提示词里带着按发送时间算好的日历",
+               "本周：周一 09-14" in system and "下周：周一 09-21" in system)
+    check_true("提示词里带着消息发送时间", "2026-09-16 15:00" in system)
+    check_true("提示词里没有没替换的占位符",
+               all(p not in system for p in ("{send_time}", "{weekday}", "{tz}", "{calendar}")))
+    check("模型没给 due_at → 规则把它补上了", result["due_at"], want_due)
+    check("并如实标出这条被规则补过", result["extractor"], "llm+rule")
+    check("due_text 用规则解析出的时间短语", result["due_text"], "下周三前")
+    check_true("把握不超过 0.8", 0 < float(result["due_confidence"]) <= 0.8, str(result["due_confidence"]))
+
+    # 模型判"不是通知"、规则也没有明确时间 → 不建条（别让闲聊变成任务）
+    reply.update({"is_notification": False, "reason": "回执", "title": "", "due_text": None})
+    try:
+        llm_pkg.acompletion = _fake_acompletion
+        result2, degraded2, _tokens2 = run_llm_path("收到", ANCHOR)
+    finally:
+        llm_pkg.acompletion = original
+    check("模型判非通知 + 规则也没有时间 → 不建条", result2, None)
+    check("而且不算降级（模型正常回答了）", degraded2, False)
 
     print()
     if fails:
