@@ -52,7 +52,7 @@ from ..normalize import attachments_payload
 from ..onebot.segments import parse_message
 from ..utils import local_day, now_ms
 from .extract import extract_with_llm, fill_due_from_rule
-from .rule_extract import rule_extract
+from .rule_extract import is_group_chore, is_noise, rule_extract
 from .trace import elapsed_ms, fmt_due, log_message, log_stage, message_meta
 
 logger = logging.getLogger(__name__)
@@ -360,9 +360,23 @@ async def parse_content(
     """按 EXTRACTOR 配置抽取。返回 (结果, 是否降级, 消耗 token)。
 
     **不抛异常**：LLM 那条路整体失败就降级到规则，并把这件事记下来。
+
+    确定性的门（闲聊 `is_noise` / 群务 `is_group_chore`）在这里**先过、且不看模型**：
+    线上出现过 v4 提示词已经写了"群务不算通知"、模型还是把「请完成群昵称修改…」
+    判成了一条通知 —— 因为那道 `GROUP_CHORE` 一票否决只长在 `rule_extract` 里，
+    `llm` 模式下模型说了算，它就从旁边绕过去了。代码说了算的部分不该由模型发挥决定，
+    顺带还省下一次模型调用。
     """
     content = str(raw.get("content") or raw.get("text") or "")
     ts = int(raw.get("ts") or now_ms())
+    chore = is_group_chore(content)
+    if chore or is_noise(content):
+        logger.info(
+            "确定性判据直接不建条：%s msg_id=%s",
+            f"群务（{chore}）" if chore else "闲聊/回执",
+            raw.get("message_id"),
+        )
+        return None, False, 0
     rule_result = rule_extract(content, ts, at_all=bool(raw.get("at_all")))
 
     if settings.extractor == "rule":

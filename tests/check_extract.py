@@ -8,9 +8,8 @@
 两个仓库必须用同一套判据与同一张日历 —— 同一条消息从实时链路（bot）和从聊天记录库
 （client）进来，结果不能不一样。**改一边就要改另一边。**
 
-最后一节会真的走一遍「拼提示词 → 调模型 → 合并规则」（只把网络层换成假的）：
-曾经这里漏改过一个函数名，导致每次模型调用都 NameError、被吞成"降级为规则抽取"，
-而当时所有自检都是绿的。
+最后一节会真的走一遍「拼提示词 → 调模型 → 合并规则」（只把网络层换成假的），
+并且钉住"群务/闲聊**不管模型怎么说**都不建条，而且不花那次调用"。
 """
 
 from __future__ import annotations
@@ -319,6 +318,33 @@ def main() -> int:  # noqa: C901
         llm_pkg.acompletion = original
     check("模型判非通知 + 规则也没有时间 → 不建条", result2, None)
     check("而且不算降级（模型正常回答了）", degraded2, False)
+
+    # 确定性判据必须**压过模型**：模型说"是通知"也不行，而且**不发那次请求**（省钱）。
+    # 线上真事：v4 提示词里明明写了"群务不算通知"，模型还是把
+    # 「各位同学：请完成群昵称修改…」判成了一条通知（因为一票否决只长在 rule_extract 里，
+    # llm 模式下模型说了算，它从旁边绕过去了）。
+    reply.update({"is_notification": True, "title": "按时报到", "due_text": "8月22日",
+                  "evidence": "请完成群昵称修改", "due_at": None})
+    calls_before = len(llm_calls)
+    try:
+        llm_pkg.acompletion = _fake_acompletion
+        vetoed, vetoed_degraded, _t = run_llm_path(
+            "各位同学：请完成群昵称修改（姓名 专业)，管理员会核实清理。", ANCHOR
+        )
+    finally:
+        llm_pkg.acompletion = original
+    check("群务：模型说是通知也不算 → 不建条", vetoed, None)
+    check("而且**没花**那次模型调用（确定性判据在调用之前）", len(llm_calls), calls_before)
+    check("也算不上降级", vetoed_degraded, False)
+
+    reply.update({"is_notification": True, "title": "闲聊", "evidence": "收到", "due_text": None})
+    try:
+        llm_pkg.acompletion = _fake_acompletion
+        noise_vetoed, _d, _t = run_llm_path("收到", ANCHOR)
+    finally:
+        llm_pkg.acompletion = original
+    check("闲聊/回执同理：不建条", noise_vetoed, None)
+    check("也没发请求", len(llm_calls), calls_before)
 
     print()
     if fails:
