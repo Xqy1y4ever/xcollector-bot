@@ -1,0 +1,57 @@
+name: Self-checks
+
+# 只跑**离线**自检：不联网、不需要后端、不需要 OneBot。
+#   · check_static          —— 用了但没定义的名字（改名漏改调用处、except 写了没导入的异常类）
+#   · check_timeparse       —— 中文相对时间（与 client 共用同一套用例，两边逐字一致）
+#   · check_location        —— 地点提取（同上）
+#   · check_extract         —— 判据门槛 + 给模型的日历 + 兜底补时间（含"真的调一次模型"的假桩）
+#   · check_commands        —— /注册 /订阅 /add /done 这些指令的语义
+#   · check_onebot_reconnect—— 断线重连与补捞
+#   · check_llm_gateway     —— 多厂商网关（用假 HTTP 服务，不打真实厂商）
+#
+# 需要**真后端**的两个（tests/check_pipeline_e2e.py、tests/check_backend_client.py）不在这里 ——
+# 部署/发版前请按 README 在本机起后端起跑一遍（`E:\Xcollector\.tmp\final-verify.ps1` 会一起跑）。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      # 放在最前面：它扫的是"执行到才会炸"的那类错误，其他测试通常跑不到那些分支。
+      # 现实中已经出现过两次（client 的 build_system_prompt 改名、本仓库的
+      # except BackendRejected 没导入），都是用户在日志里发现的。
+      - name: 静态：用了但没定义的名字
+        run: python -m tests.check_static
+
+      - name: 相对时间解析（与 client 共用同一套用例）
+        run: python -m tests.check_timeparse
+
+      - name: 地点提取（与 client 共用同一套用例）
+        run: python -m tests.check_location
+
+      - name: 抽取（判据门槛 / 日历 / LLM 那条路）
+        run: python -m tests.check_extract
+
+      - name: QQ 指令（/注册 /订阅 /add /done）
+        run: python -m tests.check_commands
+
+      - name: OneBot 断线重连与补捞
+        run: python -m tests.check_onebot_reconnect
+
+      - name: LLM 多厂商网关
+        run: python -m tests.check_llm_gateway
