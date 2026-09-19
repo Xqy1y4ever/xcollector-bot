@@ -50,6 +50,18 @@ NOTICE_KEYWORDS = re.compile(
 # 强调词，提升置信度
 EMPHASIS = re.compile(r"务必|请|要求|全体|注意|重要|截止|必须")
 
+# **群务**：改群名片/群昵称、拉人进群、查收名单、看群文件…… 这些是"群怎么用"，
+# 不是"有人要去做的事"，永远不该出现在任务板上。命中就**一票否决**（不管模型怎么说）。
+#
+# 为什么必须一票否决，而不是"算一个信号"：这类消息几乎**必定**带着"请/要求/全体"
+# 这些词（「请大家按照要求修改群名片」），光靠通知词的门槛拦不住；
+# 而它们在真实语料里占了大头（2026-09-19 用户那份数据：317 条通知里 17 条是同一句
+# 欢迎语 / 改名片提醒，还有"抓紧入群""查收班团干部名单"）。
+GROUP_CHORE = re.compile(
+    r"群昵称|群名片|修改名片|名片格式|改名卡|"
+    r"欢迎入群|抓紧入群|进群|退群|加群|入会|查收.{0,10}名单|群成员列表|群文件|群相册"
+)
+
 # 地点：规则抽取不可能做得好，只求"原文明确写了、且能高置信度认出"这几种形态。
 # 三种优先级从高到低：
 #   1. 「地点：xxx」显式标注
@@ -107,6 +119,16 @@ def is_noise(text: str) -> bool:
     return False
 
 
+def is_group_chore(text: str) -> str | None:
+    """是"群务"吗？是就返回命中的那个词（用来写日志），不是返回 None。
+
+    群务（改群名片、进群、查收名单、看群文件）**永远不是任务**，一票否决：
+    它们带着"请/要求/全体"这些词，靠通知词门槛拦不住。
+    """
+    m = GROUP_CHORE.search(text or "")
+    return m.group(0) if m else None
+
+
 def rule_extract(content: str, ts_ms: int, at_all: bool = False) -> dict | None:
     """返回一个 notification dict（不含 raw_message_id 等由调用方补齐的字段），或 None。
 
@@ -119,12 +141,22 @@ def rule_extract(content: str, ts_ms: int, at_all: bool = False) -> dict | None:
     现在必须有**通知特征**（通知类关键词 / 强调词 / @全体）才建条：只有时间的那些交给
     模型判断（`both` 模式下模型说了算），模型也不认为是通知就不建。
 
+    ## v4：**群务一票否决**
+
+    2026-09-19 看用户线上那 317 条通知：被判"是通知"的一大类是群务
+    （「请大家按照要求修改群名片」×17、「还没进群的抓紧了」「查收班团干部名单」
+    「看群公告」）。它们命中"请/要求/全体"，所以必须单独一票否决。
+
     代价说清楚：`EXTRACTOR=rule` 时，一条**既没有通知词、又没有强调词**的真通知
     （"下周三体检"里的"体检"已经补进词表，但总会有漏的）会被漏掉。所以 rule 模式
     只适合"先跑通链路"，要判得准还是得用 `both`。
     """
     text = (content or "").strip()
     if is_noise(text):
+        return None
+    chore = is_group_chore(text)
+    if chore:
+        # 不静默：调用方会把 None 记成"非通知"，这里留下判据
         return None
 
     has_keyword = bool(NOTICE_KEYWORDS.search(text))
